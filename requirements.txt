@@ -20,6 +20,9 @@ scipy>=1.11.0
 # Visualization
 matplotlib>=3.7.0
 
+# Web interface
+streamlit>=1.28.0
+
 # Data export
 PyYAML>=6.0
 
