@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+
+# Output
+output/
+*.mp4
+*.avi
+*.mov
+*.gif
+
+# Data (keep directory structure)
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
