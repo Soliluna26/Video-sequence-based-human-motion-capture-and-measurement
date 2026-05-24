@@ -9,9 +9,9 @@ Reuses all existing src/ modules without modification.
 """
 
 import base64
+import ctypes
 import io
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -19,35 +19,37 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# -- Force headless OpenCV variant --
-# mediapipe depends on opencv-contrib-python (non-headless), which requires
-# libgthread-2.0.so.0 — unavailable on Debian Trixie. We tell OpenCV's loader
-# to use the headless native library instead.
-os.environ["OPENCV_PYTHON_HEADLESS"] = "1"
+# -- Work around missing libgthread-2.0.so.0 on Debian Trixie --
+# opencv-contrib-python (pulled by mediapipe) links libgthread-2.0.so.0.
+# That library was removed in GLib 2.72+; its symbols were merged into
+# libglib-2.0.so.0 long before. We create a symlink so the dynamic linker
+# can find the symbols via the main glib library.
+_LINK_DIR = os.path.join(tempfile.gettempdir(), "mocap_lib")
+_LINK_PATH = os.path.join(_LINK_DIR, "libgthread-2.0.so.0")
+_GLIB_FOUND = None
+if not os.path.exists(_LINK_PATH):
+    for _cand in (
+        "/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0",
+        "/usr/lib/aarch64-linux-gnu/libglib-2.0.so.0",
+        "/lib/x86_64-linux-gnu/libglib-2.0.so.0",
+    ):
+        if os.path.exists(_cand):
+            os.makedirs(_LINK_DIR, exist_ok=True)
+            os.symlink(_cand, _LINK_PATH)
+            _GLIB_FOUND = _cand
+            break
+if _GLIB_FOUND:
+    # Preload glib so the symlink resolves correctly
+    try:
+        ctypes.CDLL(_GLIB_FOUND, mode=ctypes.RTLD_GLOBAL)
+    except Exception:
+        pass
+_LD = os.environ.get("LD_LIBRARY_PATH", "")
+os.environ["LD_LIBRARY_PATH"] = (
+    f"{_LINK_DIR}:{_LD}" if _LD else _LINK_DIR
+)
 
-try:
-    import cv2
-except ImportError:
-    # Env var alone wasn't enough — remove conflicting non-headless packages
-    _FIX_FLAG = "/tmp/.mocap_headless_fix"
-    if not os.path.exists(_FIX_FLAG):
-        for _pkg in ("opencv-contrib-python", "opencv-python"):
-            subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", _pkg],
-                capture_output=True, timeout=30,
-            )
-        # Reinstall headless to restore any shared files pip may have removed
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--force-reinstall",
-             "--no-deps", "opencv-contrib-python-headless"],
-            capture_output=True, timeout=60,
-        )
-        try:
-            with open(_FIX_FLAG, "w") as _f:
-                _f.write("1")
-        except OSError:
-            pass
-    import cv2
+import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
