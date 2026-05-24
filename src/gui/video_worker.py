@@ -157,7 +157,7 @@ class VideoWorker(QThread):
                 landmarks = estimator.process_frame(frame_bgr)
 
                 # Ball tracking
-                ball_pos = ball_tracker.detect(frame_bgr)
+                ball_pos = ball_tracker.detect(frame_bgr, landmarks)
 
                 self.frame_processed.emit(
                     (idx, frame_bgr.copy(), landmarks, ball_pos, dict(manual_positions))

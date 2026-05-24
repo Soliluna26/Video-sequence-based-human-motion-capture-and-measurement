@@ -49,6 +49,7 @@ CYAN = (255, 255, 0)
 BLUE = (255, 0, 0)
 WHITE = (255, 255, 255)
 GREEN = (0, 255, 0)
+ORANGE = (0, 165, 255)
 
 # Default scale factor (pixels to mm) — user-configurable
 DEFAULT_MM_PER_PIXEL = 2.0
@@ -78,7 +79,7 @@ class MainWindow(QMainWindow):
         # Replay state
         self._replay_idx: int = 0
         self._replay_timer: Optional[QTimer] = None
-        self._ball_trajectory: List[Tuple[float, float]] = []
+        self._ball_trajectory: List[Optional[Tuple[float, float]]] = []
         self._ball_velocity_history: deque = deque(maxlen=10)
 
         # Trajectory accumulators for replay rendering (manual points)
@@ -514,6 +515,11 @@ class MainWindow(QMainWindow):
         if landmarks is not None:
             canvas = self._draw_skeleton(canvas, landmarks, CYAN)
 
+        # Accumulate and draw detected basketball trajectory (orange).
+        # None marks frames where the ball is out of view, so the trail breaks.
+        self._ball_trajectory.append(ball_pos)
+        self._draw_ball_trajectory(canvas, self._ball_trajectory)
+
         # Accumulate and draw manual point trajectories (blue)
         for pid, pos in manual_positions.items():
             if pid not in self._manual_trajectories:
@@ -559,6 +565,39 @@ class MainWindow(QMainWindow):
                 p1 = (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1)))
                 p2 = (int(np.clip(x2, 0, w - 1)), int(np.clip(y2, 0, h - 1)))
                 cv2.line(canvas, p1, p2, color, 2)
+        return canvas
+
+    def _draw_ball_trajectory(self, canvas: np.ndarray, trajectory: List[Optional[Tuple[float, float]]]) -> np.ndarray:
+        """Draw the basketball trajectory and current detected position."""
+        if not trajectory:
+            return canvas
+
+        h, w = canvas.shape[:2]
+        for i in range(1, len(trajectory)):
+            if trajectory[i - 1] is None or trajectory[i] is None:
+                continue
+            x1, y1 = trajectory[i - 1]
+            x2, y2 = trajectory[i]
+            if np.hypot(x2 - x1, y2 - y1) > 95.0:
+                continue
+            p1 = (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1)))
+            p2 = (int(np.clip(x2, 0, w - 1)), int(np.clip(y2, 0, h - 1)))
+            cv2.line(canvas, p1, p2, ORANGE, 2)
+
+        for point in trajectory[:: max(1, len(trajectory) // 80)]:
+            if point is None:
+                continue
+            x, y = point
+            px, py = int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
+            cv2.circle(canvas, (px, py), 2, ORANGE, -1)
+
+        latest = trajectory[-1]
+        if latest is None:
+            return canvas
+        x, y = latest
+        px, py = int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
+        cv2.circle(canvas, (px, py), 8, ORANGE, -1)
+        cv2.circle(canvas, (px, py), 12, WHITE, 2)
         return canvas
 
     def _draw_skeleton(self, canvas: np.ndarray, landmarks: PoseResult, color: Tuple[int, int, int]) -> np.ndarray:
@@ -681,12 +720,16 @@ class MainWindow(QMainWindow):
         writer = cv2.VideoWriter(output_path, fourcc, self.fps, (w, h))
 
         saved_manual: Dict[int, List[Tuple[float, float]]] = {}
+        saved_ball: List[Optional[Tuple[float, float]]] = []
 
         for frame_idx, frame_bgr, landmarks, ball_pos, manual_positions in self.recording_data:
             canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
             if landmarks is not None:
                 canvas = self._draw_skeleton(canvas, landmarks, CYAN)
+
+            saved_ball.append(ball_pos)
+            self._draw_ball_trajectory(canvas, saved_ball)
 
             # Accumulate and draw manual trajectories
             for pid, pos in manual_positions.items():
