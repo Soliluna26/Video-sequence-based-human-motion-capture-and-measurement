@@ -9,10 +9,9 @@ Reuses all existing src/ modules without modification.
 """
 
 import base64
+import importlib.metadata as _imd
 import io
 import os
-import shutil
-import site
 import sys
 import tempfile
 import time
@@ -20,28 +19,23 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# -- Force cv2 to load headless native libraries --
-# mediapipe depends on opencv-contrib-python (non-headless), whose native .so
-# files link libgthread-2.0.so.0 — removed in Debian Trixie (GLib ≥ 2.72).
-# Both headless and non-headless OpenCV packages are installed side by side.
-# The cv2 bootstrap loader picks non-headless first and crashes.
-#
-# Fix: delete the non-headless native library directory before importing cv2.
-# The Python-level cv2/ package stays intact; the bootstrap then only finds
-# the headless .so files and loads those instead.
-# This runs once per deployment (guarded by a flag file under /tmp).
-_FIX_FLAG = "/tmp/.mocap_native_fix"
-if not os.path.exists(_FIX_FLAG):
-    for _sp in site.getsitepackages():
-        for _dirname in ("opencv_contrib_python.libs", "opencv_python.libs"):
-            _libdir = os.path.join(_sp, _dirname)
-            if os.path.isdir(_libdir):
-                shutil.rmtree(_libdir)
-    try:
-        with open(_FIX_FLAG, "w") as _f:
-            _f.write("1")
-    except OSError:
-        pass
+# -- Force cv2 to load headless native library --
+# mediapipe pulls opencv-contrib-python (non-headless) whose .so links
+# libgthread-2.0.so.0 (removed in GLib >= 2.72, not present on Debian Trixie).
+# opencv-contrib-python-headless is installed but cv2's bootstrap discovers
+# the non-headless variant first via importlib.metadata and loads its .so,
+# which crashes.  We monkey-patch distributions() to hide the non-headless
+# packages so the bootstrap only sees the headless one.
+_orig_distributions = _imd.distributions
+
+def _patched_distributions(**kwargs):
+    for dist in _orig_distributions(**kwargs):
+        name = dist.metadata.get("Name", "")
+        if name in ("opencv-contrib-python", "opencv-python"):
+            continue
+        yield dist
+
+_imd.distributions = _patched_distributions
 
 import cv2
 import numpy as np
