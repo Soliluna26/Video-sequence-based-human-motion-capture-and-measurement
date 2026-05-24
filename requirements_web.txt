@@ -1,0 +1,24 @@
+# Web app dependencies for the Streamlit interface
+# Install: pip install -r requirements_web.txt
+
+# Web framework
+streamlit>=1.28.0
+
+# Video / image processing
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+Pillow>=10.0.0
+imageio>=2.31.0
+
+# Pose estimation
+mediapipe>=0.10.7
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Data
+PyYAML>=6.0
