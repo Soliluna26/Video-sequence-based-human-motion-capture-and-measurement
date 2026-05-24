@@ -1,0 +1,27 @@
+# Video-based Human Motion Capture and Measurement System
+# Core dependencies
+
+# Video / image processing
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+Pillow>=10.0.0
+imageio>=2.31.0
+
+# GUI
+PyQt5>=5.15.0
+
+# Pose estimation
+mediapipe>=0.10.7
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Data export
+PyYAML>=6.0
+
+# Optional: MATLAB file export
+scipy>=1.11.0

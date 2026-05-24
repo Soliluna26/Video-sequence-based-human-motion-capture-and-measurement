@@ -1,0 +1,145 @@
+# MediaPipe Pose Landmark Configuration
+# 33 keypoints as defined by MediaPipe Pose Landmarker
+# Reference: https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
+
+landmarks:
+  0:
+    name: nose
+    category: face
+  1:
+    name: left_eye_inner
+    category: face
+  2:
+    name: left_eye
+    category: face
+  3:
+    name: left_eye_outer
+    category: face
+  4:
+    name: right_eye_inner
+    category: face
+  5:
+    name: right_eye
+    category: face
+  6:
+    name: right_eye_outer
+    category: face
+  7:
+    name: left_ear
+    category: face
+  8:
+    name: right_ear
+    category: face
+  9:
+    name: mouth_left
+    category: face
+  10:
+    name: mouth_right
+    category: face
+  11:
+    name: left_shoulder
+    category: upper_body
+  12:
+    name: right_shoulder
+    category: upper_body
+  13:
+    name: left_elbow
+    category: upper_body
+  14:
+    name: right_elbow
+    category: upper_body
+  15:
+    name: left_wrist
+    category: upper_body
+  16:
+    name: right_wrist
+    category: upper_body
+  17:
+    name: left_pinky
+    category: upper_body
+  18:
+    name: right_pinky
+    category: upper_body
+  19:
+    name: left_index
+    category: upper_body
+  20:
+    name: right_index
+    category: upper_body
+  21:
+    name: left_thumb
+    category: upper_body
+  22:
+    name: right_thumb
+    category: upper_body
+  23:
+    name: left_hip
+    category: lower_body
+  24:
+    name: right_hip
+    category: lower_body
+  25:
+    name: left_knee
+    category: lower_body
+  26:
+    name: right_knee
+    category: lower_body
+  27:
+    name: left_ankle
+    category: lower_body
+  28:
+    name: right_ankle
+    category: lower_body
+  29:
+    name: left_heel
+    category: lower_body
+  30:
+    name: right_heel
+    category: lower_body
+  31:
+    name: left_foot_index
+    category: lower_body
+  32:
+    name: right_foot_index
+    category: lower_body
+
+# Predefined joint angle definitions (three-point angles)
+# format: [proximal_point, vertex_point, distal_point]
+angle_definitions:
+  left_knee_angle: [23, 25, 27]     # hip-knee-ankle
+  right_knee_angle: [24, 26, 28]    # hip-knee-ankle
+  left_elbow_angle: [11, 13, 15]    # shoulder-elbow-wrist
+  right_elbow_angle: [12, 14, 16]   # shoulder-elbow-wrist
+  left_hip_angle: [11, 23, 25]      # shoulder-hip-knee
+  right_hip_angle: [12, 24, 26]     # shoulder-hip-knee
+  left_shoulder_angle: [13, 11, 23] # elbow-shoulder-hip
+  right_shoulder_angle: [14, 12, 24] # elbow-shoulder-hip
+  left_ankle_angle: [25, 27, 31]    # knee-ankle-foot_index
+  right_ankle_angle: [26, 28, 32]   # knee-ankle-foot_index
+
+# Bone connections for visualization (index pairs)
+connections:
+  - [11, 12]  # shoulders
+  - [11, 23]  # left torso
+  - [12, 24]  # right torso
+  - [23, 24]  # hips
+  - [11, 13]  # left upper arm
+  - [13, 15]  # left forearm
+  - [12, 14]  # right upper arm
+  - [14, 16]  # right forearm
+  - [23, 25]  # left thigh
+  - [25, 27]  # left shin
+  - [24, 26]  # right thigh
+  - [26, 28]  # right shin
+  - [15, 17]  # left hand
+  - [15, 19]  # left hand
+  - [16, 18]  # right hand
+  - [16, 20]  # right hand
+  - [17, 19]  # left hand
+  - [18, 20]  # right hand
+  - [27, 29]  # left foot
+  - [27, 31]  # left foot
+  - [28, 30]  # right foot
+  - [28, 32]  # right foot
+  - [29, 31]  # left foot
+  - [30, 32]  # right foot
