@@ -9,9 +9,10 @@ Reuses all existing src/ modules without modification.
 """
 
 import base64
-import ctypes
 import io
 import os
+import shutil
+import site
 import sys
 import tempfile
 import time
@@ -19,35 +20,28 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# -- Work around missing libgthread-2.0.so.0 on Debian Trixie --
-# opencv-contrib-python (pulled by mediapipe) links libgthread-2.0.so.0.
-# That library was removed in GLib 2.72+; its symbols were merged into
-# libglib-2.0.so.0 long before. We create a symlink so the dynamic linker
-# can find the symbols via the main glib library.
-_LINK_DIR = os.path.join(tempfile.gettempdir(), "mocap_lib")
-_LINK_PATH = os.path.join(_LINK_DIR, "libgthread-2.0.so.0")
-_GLIB_FOUND = None
-if not os.path.exists(_LINK_PATH):
-    for _cand in (
-        "/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0",
-        "/usr/lib/aarch64-linux-gnu/libglib-2.0.so.0",
-        "/lib/x86_64-linux-gnu/libglib-2.0.so.0",
-    ):
-        if os.path.exists(_cand):
-            os.makedirs(_LINK_DIR, exist_ok=True)
-            os.symlink(_cand, _LINK_PATH)
-            _GLIB_FOUND = _cand
-            break
-if _GLIB_FOUND:
-    # Preload glib so the symlink resolves correctly
+# -- Force cv2 to load headless native libraries --
+# mediapipe depends on opencv-contrib-python (non-headless), whose native .so
+# files link libgthread-2.0.so.0 — removed in Debian Trixie (GLib ≥ 2.72).
+# Both headless and non-headless OpenCV packages are installed side by side.
+# The cv2 bootstrap loader picks non-headless first and crashes.
+#
+# Fix: delete the non-headless native library directory before importing cv2.
+# The Python-level cv2/ package stays intact; the bootstrap then only finds
+# the headless .so files and loads those instead.
+# This runs once per deployment (guarded by a flag file under /tmp).
+_FIX_FLAG = "/tmp/.mocap_native_fix"
+if not os.path.exists(_FIX_FLAG):
+    for _sp in site.getsitepackages():
+        for _dirname in ("opencv_contrib_python.libs", "opencv_python.libs"):
+            _libdir = os.path.join(_sp, _dirname)
+            if os.path.isdir(_libdir):
+                shutil.rmtree(_libdir)
     try:
-        ctypes.CDLL(_GLIB_FOUND, mode=ctypes.RTLD_GLOBAL)
-    except Exception:
+        with open(_FIX_FLAG, "w") as _f:
+            _f.write("1")
+    except OSError:
         pass
-_LD = os.environ.get("LD_LIBRARY_PATH", "")
-os.environ["LD_LIBRARY_PATH"] = (
-    f"{_LINK_DIR}:{_LD}" if _LD else _LINK_DIR
-)
 
 import cv2
 import numpy as np
