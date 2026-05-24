@@ -1,24 +1,27 @@
 """Main PyQt5 application window for human motion capture and measurement.
 
 Provides: video loading, live recording with background processing,
-black-background replay with cyan skeleton, basketball tracking,
-and real-time physics measurements.
+black-background replay with skeleton, manual point tracking,
+and trajectory visualization.
 """
 
+import csv
 import os
 from collections import deque
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -28,6 +31,7 @@ from PyQt5.QtWidgets import (
 )
 
 from src.gui.video_worker import VideoWorker
+from src.point_manager import PointManager
 from src.pose_estimator import KEYPOINT_NAMES, PoseResult
 
 # Skeleton bone connections for drawing (MediaPipe pose connections)
@@ -42,8 +46,7 @@ SKELETON_KEYPOINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31
 
 # Colors (BGR for OpenCV drawing)
 CYAN = (255, 255, 0)
-RED = (0, 0, 255)
-YELLOW = (0, 255, 255)
+BLUE = (255, 0, 0)
 WHITE = (255, 255, 255)
 GREEN = (0, 255, 0)
 
@@ -57,23 +60,41 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Human Motion Capture & Measurement System")
-        self.setMinimumSize(960, 680)
+        self.setMinimumSize(1200, 680)
 
         # State
         self.video_path: Optional[str] = None
         self.fps: float = 30.0
         self.frame_count: int = 0
-        self.mode: str = "IDLE"  # IDLE | RECORDING | REPLAY
+        self.mode: str = "IDLE"  # IDLE | RECORDING | REPLAY_READY | REPLAY
         self.mm_per_pixel: float = DEFAULT_MM_PER_PIXEL
 
-        # Recording data: list of (frame_idx, frame_bgr, landmarks, ball_pos)
-        self.recording_data: List[Tuple[int, np.ndarray, Optional[PoseResult], Optional[Tuple[float, float]]]] = []
+        # Recording data: (frame_idx, frame_bgr, landmarks, ball_pos, manual_positions)
+        self.recording_data: List[Tuple[
+            int, np.ndarray, Optional[PoseResult],
+            Optional[Tuple[float, float]], Dict[int, Tuple[float, float]]
+        ]] = []
 
         # Replay state
         self._replay_idx: int = 0
         self._replay_timer: Optional[QTimer] = None
         self._ball_trajectory: List[Tuple[float, float]] = []
         self._ball_velocity_history: deque = deque(maxlen=10)
+
+        # Trajectory accumulators for replay rendering (manual points)
+        self._manual_trajectories: Dict[int, List[Tuple[float, float]]] = {}
+
+        # Manual point state
+        self._adding_manual_point: bool = False
+        self._pending_manual_points: List[Tuple[float, float]] = []
+        self.point_manager = PointManager()
+
+        # Display scaling info for mouse-coordinate mapping
+        self._display_scale: float = 1.0
+        self._display_offset_x: int = 0
+        self._display_offset_y: int = 0
+        self._frame_orig_w: int = 640
+        self._frame_orig_h: int = 480
 
         # Worker thread
         self._worker: Optional[VideoWorker] = None
@@ -86,21 +107,28 @@ class MainWindow(QMainWindow):
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(10, 10, 10, 10)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(12)
+
+        # ---- Left panel: video + progress + buttons ----
+        left_panel = QVBoxLayout()
+        left_panel.setSpacing(8)
 
         # Video display
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(640, 480)
         self.video_label.setStyleSheet("background-color: #000000; border: 2px solid #333;")
-        self.video_label.setText("Drop a video file or use File → Open")
-        layout.addWidget(self.video_label, stretch=1)
+        self.video_label.setText("Drop a video file or use File -> Open")
+        self.video_label.installEventFilter(self)
+        self.video_label.setMouseTracking(True)
+        left_panel.addWidget(self.video_label, stretch=1)
 
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        left_panel.addWidget(self.progress_bar)
 
         # Button row
         btn_layout = QHBoxLayout()
@@ -130,7 +158,47 @@ class MainWindow(QMainWindow):
         self.btn_exit.clicked.connect(self.close)
         btn_layout.addWidget(self.btn_exit)
 
-        layout.addLayout(btn_layout)
+        left_panel.addLayout(btn_layout)
+
+        main_layout.addLayout(left_panel, stretch=1)
+
+        # ---- Right sidebar ----
+        sidebar = QVBoxLayout()
+        sidebar.setSpacing(8)
+
+        sidebar_title = QLabel("Manual Points")
+        sidebar_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ccc;")
+        sidebar.addWidget(sidebar_title)
+
+        self.btn_add_point = QPushButton("Add Manual Point")
+        self.btn_add_point.setCheckable(True)
+        self.btn_add_point.clicked.connect(self._on_toggle_add_point)
+        self.btn_add_point.setStyleSheet(
+            "QPushButton { background-color: #3a3a3a; color: #e0e0e0; "
+            "border: 1px solid #555; border-radius: 4px; padding: 6px 12px; }"
+            "QPushButton:checked { background-color: #005a9e; border-color: #0078d4; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+            "QPushButton:disabled { background-color: #2a2a2a; color: #666; }"
+        )
+        sidebar.addWidget(self.btn_add_point)
+
+        self.btn_export_csv = QPushButton("Export CSV")
+        self.btn_export_csv.clicked.connect(self._on_export_csv)
+        sidebar.addWidget(self.btn_export_csv)
+
+        self.manual_points_list = QListWidget()
+        self.manual_points_list.setMinimumWidth(180)
+        self.manual_points_list.setStyleSheet(
+            "QListWidget { background-color: #2a2a2a; border: 1px solid #555; color: #ccc; }"
+            "QListWidget::item { padding: 2px; }"
+        )
+        sidebar.addWidget(self.manual_points_list, stretch=1)
+
+        # Wrap sidebar in a widget with fixed width
+        sidebar_widget = QWidget()
+        sidebar_widget.setLayout(sidebar)
+        sidebar_widget.setMaximumWidth(240)
+        main_layout.addWidget(sidebar_widget)
 
         # Style buttons
         for btn in [self.btn_start, self.btn_end, self.btn_save, self.btn_replay]:
@@ -147,9 +215,82 @@ class MainWindow(QMainWindow):
         self.btn_end.setEnabled(is_recording)
         self.btn_save.setEnabled(is_replay_ready)
         self.btn_replay.setEnabled(is_replay_ready)
+        self.btn_add_point.setEnabled(self.video_path is not None and not self.mode == "REPLAY")
+        self.btn_export_csv.setEnabled(is_replay_ready)
         self.progress_bar.setVisible(is_recording)
 
+    # --------------- Event Filter for Mouse Clicks ---------------
+
+    def eventFilter(self, obj, event):
+        if obj is self.video_label and event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton and self._adding_manual_point:
+                self._handle_video_click(event.pos().x(), event.pos().y())
+                return True
+        return super().eventFilter(obj, event)
+
+    def _handle_video_click(self, click_x: int, click_y: int):
+        """Convert click coordinates to frame coordinates and add a manual point."""
+        frame_x = (click_x - self._display_offset_x) / self._display_scale
+        frame_y = (click_y - self._display_offset_y) / self._display_scale
+        frame_x = max(0.0, min(frame_x, self._frame_orig_w - 1))
+        frame_y = max(0.0, min(frame_y, self._frame_orig_h - 1))
+
+        point_id = self.point_manager.add_point(frame_x, frame_y)
+
+        if self.mode == "RECORDING" and self._worker:
+            self._worker.add_manual_point(frame_x, frame_y)
+        else:
+            self._pending_manual_points.append((frame_x, frame_y))
+
+        self._add_point_to_sidebar(point_id)
+        self._set_button_states()
+
+    def _add_point_to_sidebar(self, point_id: int):
+        """Add a manual point entry to the sidebar list widget."""
+        item_widget = QWidget()
+        item_layout = QHBoxLayout(item_widget)
+        item_layout.setContentsMargins(6, 2, 6, 2)
+        item_layout.setSpacing(8)
+
+        label = QLabel(f"Point #{point_id}")
+        label.setStyleSheet("color: #8af;")
+        item_layout.addWidget(label)
+
+        item_layout.addStretch()
+
+        delete_btn = QPushButton("X")
+        delete_btn.setFixedSize(24, 24)
+        delete_btn.setStyleSheet(
+            "QPushButton { background-color: #5a2020; color: #ff6666; border: 1px solid #833; "
+            "border-radius: 2px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #7a3030; }"
+        )
+        delete_btn.clicked.connect(lambda checked, pid=point_id: self._delete_manual_point(pid))
+        item_layout.addWidget(delete_btn)
+
+        list_item = QListWidgetItem()
+        list_item.setData(Qt.UserRole, point_id)
+        list_item.setSizeHint(item_widget.sizeHint())
+        self.manual_points_list.addItem(list_item)
+        self.manual_points_list.setItemWidget(list_item, item_widget)
+
+    def _delete_manual_point(self, point_id: int):
+        """Remove a manual point by ID."""
+        self.point_manager.delete_point(point_id)
+        for i in range(self.manual_points_list.count()):
+            item = self.manual_points_list.item(i)
+            if item.data(Qt.UserRole) == point_id:
+                self.manual_points_list.takeItem(i)
+                break
+
     # --------------- Slots ---------------
+
+    def _on_toggle_add_point(self):
+        self._adding_manual_point = self.btn_add_point.isChecked()
+        if self._adding_manual_point:
+            self.video_label.setCursor(Qt.CrossCursor)
+        else:
+            self.video_label.setCursor(Qt.ArrowCursor)
 
     def _on_open(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -182,6 +323,14 @@ class MainWindow(QMainWindow):
         self.recording_data.clear()
         self._ball_trajectory.clear()
         self._ball_velocity_history.clear()
+
+        self._manual_trajectories.clear()
+        self._pending_manual_points.clear()
+        self.point_manager.clear()
+        self.manual_points_list.clear()
+        self._adding_manual_point = False
+        self.btn_add_point.setChecked(False)
+        self.video_label.setCursor(Qt.ArrowCursor)
         self.mode = "IDLE"
         self._set_button_states()
         self.setWindowTitle(f"Motion Capture — {os.path.basename(path)}  [{self.frame_count} fr @ {self.fps:.1f} fps]")
@@ -196,7 +345,17 @@ class MainWindow(QMainWindow):
         self._ball_trajectory.clear()
         self._ball_velocity_history.clear()
 
+        self._manual_trajectories.clear()
+        self.point_manager.clear()
+        self.manual_points_list.clear()
+
+        # Re-add pending manual points to the fresh PointManager
+        for px, py in self._pending_manual_points:
+            pid = self.point_manager.add_point(px, py)
+            self._add_point_to_sidebar(pid)
+
         self._worker = VideoWorker(self.video_path)
+        self._worker.initial_manual_points = list(self._pending_manual_points)
         self._worker.frame_processed.connect(self._on_frame_processed)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_processing.connect(self._on_finished)
@@ -215,10 +374,13 @@ class MainWindow(QMainWindow):
             self._compute_measurements()
         else:
             self.mode = "IDLE"
+        self._adding_manual_point = False
+        self.btn_add_point.setChecked(False)
+        self.video_label.setCursor(Qt.ArrowCursor)
         self._set_button_states()
 
     def _on_replay(self):
-        """Start black-background replay."""
+        """Start black-background replay with trajectories."""
         if not self.recording_data:
             return
         self.mode = "REPLAY"
@@ -226,6 +388,8 @@ class MainWindow(QMainWindow):
         self._replay_idx = 0
         self._ball_trajectory.clear()
         self._ball_velocity_history.clear()
+
+        self._manual_trajectories.clear()
 
         # Stop existing timer
         if self._replay_timer:
@@ -238,8 +402,15 @@ class MainWindow(QMainWindow):
 
     def _on_frame_processed(self, data: tuple):
         """Receive processed frame from worker thread."""
-        frame_idx, frame_bgr, landmarks, ball_pos = data
-        self.recording_data.append((frame_idx, frame_bgr, landmarks, ball_pos))
+        frame_idx, frame_bgr, landmarks, ball_pos, manual_positions = data
+        self.recording_data.append((frame_idx, frame_bgr, landmarks, ball_pos, manual_positions))
+
+        # Update PointManager history from worker's tracking results
+        for pid, pos in manual_positions.items():
+            pt = self.point_manager.points.get(pid)
+            if pt is not None and pt["active"]:
+                pt["pos"] = pos
+                pt["history"].append((frame_idx, pos[0], pos[1]))
 
         # During recording, show original video
         if self.mode == "RECORDING":
@@ -254,6 +425,9 @@ class MainWindow(QMainWindow):
         if self.mode == "RECORDING":
             self.mode = "REPLAY_READY"
             self._compute_measurements()
+            self._adding_manual_point = False
+            self.btn_add_point.setChecked(False)
+            self.video_label.setCursor(Qt.ArrowCursor)
             self._set_button_states()
 
     def _on_error(self, message: str):
@@ -273,6 +447,18 @@ class MainWindow(QMainWindow):
             return
         self._save_replay_video(path)
 
+    def _on_export_csv(self):
+        """Export all tracking data (human + manual) to CSV."""
+        if not self.recording_data:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Tracking CSV", "output/tracking_data.csv",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+        self._export_tracking_csv(path)
+
     # --------------- Display ---------------
 
     def _display_frame(self, frame_bgr: np.ndarray, is_preview: bool = False):
@@ -283,11 +469,23 @@ class MainWindow(QMainWindow):
         # Scale to fit label while keeping aspect ratio
         label_w = self.video_label.width()
         label_h = self.video_label.height()
+
+        # Store info for mouse-coordinate mapping
+        self._frame_orig_w = w
+        self._frame_orig_h = h
+
         if label_w > 10 and label_h > 10:
             scale = min(label_w / w, label_h / h)
             new_w = max(1, int(w * scale))
             new_h = max(1, int(h * scale))
             rgb = cv2.resize(rgb, (new_w, new_h))
+            self._display_scale = scale
+            self._display_offset_x = (label_w - new_w) // 2
+            self._display_offset_y = (label_h - new_h) // 2
+        else:
+            self._display_scale = 1.0
+            self._display_offset_x = 0
+            self._display_offset_y = 0
 
         qimage = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[1] * 3, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimage)
@@ -300,7 +498,7 @@ class MainWindow(QMainWindow):
     # --------------- Replay Engine ---------------
 
     def _replay_step(self):
-        """Render one replay frame on black background."""
+        """Render one replay frame on black background with trajectories."""
         if self._replay_idx >= len(self.recording_data):
             self._replay_timer.stop()
             self.mode = "REPLAY_READY"
@@ -308,29 +506,34 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Replay Complete", "Replay finished.")
             return
 
-        frame_idx, frame_bgr, landmarks, ball_pos = self.recording_data[self._replay_idx]
+        frame_idx, frame_bgr, landmarks, ball_pos, manual_positions = self.recording_data[self._replay_idx]
         h, w = frame_bgr.shape[:2]
         canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # Draw cyan skeleton
+        # Draw skeleton
         if landmarks is not None:
             canvas = self._draw_skeleton(canvas, landmarks, CYAN)
 
-        # Track ball trajectory
-        if ball_pos is not None:
-            self._ball_trajectory.append(ball_pos)
-            # Draw red ball
-            bx, by = int(ball_pos[0]), int(ball_pos[1])
-            bx = np.clip(bx, 0, w - 1)
-            by = np.clip(by, 0, h - 1)
-            cv2.circle(canvas, (bx, by), 10, RED, -1)
-            cv2.circle(canvas, (bx, by), 13, RED, 2)
+        # Accumulate and draw manual point trajectories (blue)
+        for pid, pos in manual_positions.items():
+            if pid not in self._manual_trajectories:
+                self._manual_trajectories[pid] = []
+            self._manual_trajectories[pid].append(pos)
 
-        # Draw yellow trajectory
-        if len(self._ball_trajectory) > 1:
-            pts = np.array([(int(p[0]), int(p[1])) for p in self._ball_trajectory], dtype=np.int32)
-            for i in range(1, len(pts)):
-                cv2.line(canvas, tuple(pts[i - 1]), tuple(pts[i]), YELLOW, 2)
+        canvas = self._draw_trajectories(canvas, self._manual_trajectories, BLUE)
+
+        # Draw small circles at each tracked point + larger circle at current position
+        for pid, pos in manual_positions.items():
+            px, py = int(np.clip(pos[0], 0, w - 1)), int(np.clip(pos[1], 0, h - 1))
+            # Current position: larger filled circle + outline
+            cv2.circle(canvas, (px, py), 6, BLUE, -1)
+            cv2.circle(canvas, (px, py), 9, BLUE, 2)
+
+        # Draw small dots on every tracked sample point along each trajectory
+        for pid, pts in self._manual_trajectories.items():
+            for px, py in pts:
+                cx, cy = int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1))
+                cv2.circle(canvas, (cx, cy), 3, BLUE, -1)
 
         # Draw measurement overlay
         vel, dist, elapsed = self._calc_measurements(frame_idx)
@@ -339,11 +542,29 @@ class MainWindow(QMainWindow):
         self._display_replay_frame(canvas)
         self._replay_idx += 1
 
+    def _draw_trajectories(
+        self,
+        canvas: np.ndarray,
+        trajectories: Dict[int, List[Tuple[float, float]]],
+        color: Tuple[int, int, int],
+    ) -> np.ndarray:
+        """Draw all accumulated trajectories on canvas."""
+        h, w = canvas.shape[:2]
+        for pts in trajectories.values():
+            if len(pts) < 2:
+                continue
+            for i in range(1, len(pts)):
+                x1, y1 = pts[i - 1]
+                x2, y2 = pts[i]
+                p1 = (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1)))
+                p2 = (int(np.clip(x2, 0, w - 1)), int(np.clip(y2, 0, h - 1)))
+                cv2.line(canvas, p1, p2, color, 2)
+        return canvas
+
     def _draw_skeleton(self, canvas: np.ndarray, landmarks: PoseResult, color: Tuple[int, int, int]) -> np.ndarray:
         """Draw skeleton stick figure on canvas."""
         h, w = canvas.shape[:2]
 
-        # Draw joint points
         for idx in SKELETON_KEYPOINTS:
             if idx >= len(landmarks):
                 continue
@@ -353,7 +574,6 @@ class MainWindow(QMainWindow):
             px, py = int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))
             cv2.circle(canvas, (px, py), 4, color, -1)
 
-        # Draw bone lines
         for p1, p2 in BONE_CONNECTIONS:
             if p1 >= len(landmarks) or p2 >= len(landmarks):
                 continue
@@ -368,20 +588,15 @@ class MainWindow(QMainWindow):
         return canvas
 
     def _calc_measurements(self, frame_idx: int) -> Tuple[float, float, float]:
-        """Calculate instantaneous velocity, cumulative distance, elapsed time.
+        """Calculate instantaneous velocity, cumulative distance, elapsed time."""
+        elapsed = frame_idx / self.fps
 
-        Velocity is smoothed using a moving average of recent frame-to-frame speeds.
-        """
-        elapsed = frame_idx / self.fps  # seconds
-
-        # Find ball positions up to current frame
         ball_positions = []
         for i in range(min(frame_idx + 1, len(self.recording_data))):
-            _, _, _, bp = self.recording_data[i]
+            _, _, _, bp, _ = self.recording_data[i]
             if bp is not None:
                 ball_positions.append(bp)
 
-        # Cumulative distance (pixels → mm)
         dist_px = 0.0
         for i in range(1, len(ball_positions)):
             dx = ball_positions[i][0] - ball_positions[i - 1][0]
@@ -389,10 +604,8 @@ class MainWindow(QMainWindow):
             dist_px += np.sqrt(dx * dx + dy * dy)
         dist_mm = dist_px * self.mm_per_pixel
 
-        # Instantaneous velocity (px/frame → mm/s, smoothed)
         vel_mm_s = 0.0
         if len(ball_positions) >= 2:
-            # Use last few frames for smoothing
             recent = ball_positions[-min(5, len(ball_positions)):]
             speeds = []
             for i in range(1, len(recent)):
@@ -405,7 +618,6 @@ class MainWindow(QMainWindow):
                 vel_mm_s = float(np.mean(speeds))
 
         self._ball_velocity_history.append(vel_mm_s)
-        # Extra smoothing across time
         if len(self._ball_velocity_history) > 0:
             vel_mm_s = float(np.mean(self._ball_velocity_history))
 
@@ -427,7 +639,6 @@ class MainWindow(QMainWindow):
         y0 = 30
         for i, text in enumerate(lines):
             y = y0 + i * 30
-            # Black outline
             cv2.putText(canvas, text, (12, y - 1), font, font_scale, outline, thickness + 2, cv2.LINE_AA)
             cv2.putText(canvas, text, (12, y + 1), font, font_scale, outline, thickness + 2, cv2.LINE_AA)
             cv2.putText(canvas, text, (10, y), font, font_scale, color, thickness, cv2.LINE_AA)
@@ -437,7 +648,7 @@ class MainWindow(QMainWindow):
     def _compute_measurements(self):
         """Pre-compute summary measurements after recording finishes."""
         ball_positions = []
-        for _, _, _, bp in self.recording_data:
+        for _, _, _, bp, _ in self.recording_data:
             if bp is not None:
                 ball_positions.append(bp)
 
@@ -455,11 +666,12 @@ class MainWindow(QMainWindow):
         print(f"Frames with ball detected: {len(ball_positions)}")
         print(f"Total ball distance: {total_dist_px * self.mm_per_pixel:.2f} mm")
         print(f"Duration: {len(self.recording_data) / self.fps:.2f} s")
+        print(f"Manual points recorded: {len(self._manual_trajectories)}")
 
     # --------------- Save ---------------
 
     def _save_replay_video(self, output_path: str):
-        """Render replay frames to an MP4 file."""
+        """Render replay frames to an MP4 file with trajectories."""
         if not self.recording_data:
             return
 
@@ -468,25 +680,32 @@ class MainWindow(QMainWindow):
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(output_path, fourcc, self.fps, (w, h))
 
-        saved_trajectory = []
+        saved_manual: Dict[int, List[Tuple[float, float]]] = {}
 
-        for frame_idx, frame_bgr, landmarks, ball_pos in self.recording_data:
+        for frame_idx, frame_bgr, landmarks, ball_pos, manual_positions in self.recording_data:
             canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
             if landmarks is not None:
                 canvas = self._draw_skeleton(canvas, landmarks, CYAN)
 
-            if ball_pos is not None:
-                saved_trajectory.append(ball_pos)
-                bx, by = int(ball_pos[0]), int(ball_pos[1])
-                bx, by = np.clip(bx, 0, w - 1), np.clip(by, 0, h - 1)
-                cv2.circle(canvas, (bx, by), 10, RED, -1)
-                cv2.circle(canvas, (bx, by), 13, RED, 2)
+            # Accumulate and draw manual trajectories
+            for pid, pos in manual_positions.items():
+                if pid not in saved_manual:
+                    saved_manual[pid] = []
+                saved_manual[pid].append(pos)
 
-            if len(saved_trajectory) > 1:
-                pts = np.array([(int(p[0]), int(p[1])) for p in saved_trajectory], dtype=np.int32)
-                for i in range(1, len(pts)):
-                    cv2.line(canvas, tuple(pts[i - 1]), tuple(pts[i]), YELLOW, 2)
+            canvas = self._draw_trajectories(canvas, saved_manual, BLUE)
+
+            for pid, pos in manual_positions.items():
+                px, py = int(np.clip(pos[0], 0, w - 1)), int(np.clip(pos[1], 0, h - 1))
+                cv2.circle(canvas, (px, py), 6, BLUE, -1)
+                cv2.circle(canvas, (px, py), 9, BLUE, 2)
+
+            # Small dots on every tracked sample point
+            for pid, pts in saved_manual.items():
+                for px, py in pts:
+                    cx, cy = int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1))
+                    cv2.circle(canvas, (cx, cy), 3, BLUE, -1)
 
             vel, dist, elapsed = self._calc_measurements(frame_idx)
             canvas = self._draw_measurements(canvas, vel, dist, elapsed)
@@ -495,3 +714,34 @@ class MainWindow(QMainWindow):
 
         writer.release()
         QMessageBox.information(self, "Saved", f"Replay video saved to:\n{output_path}")
+
+    # --------------- Export ---------------
+
+    def _export_tracking_csv(self, output_path: str):
+        """Export all tracking data (human keypoints + manual points) to CSV.
+
+        Format (long form): frame_idx, time_sec, point_type, point_id, name, x, y
+        """
+        if not self.recording_data:
+            return
+
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame_idx", "time_sec", "point_type", "point_id", "name", "x", "y"])
+
+            for frame_idx, frame_bgr, landmarks, ball_pos, manual_positions in self.recording_data:
+                time_sec = frame_idx / self.fps
+
+                # Human keypoints
+                if landmarks is not None:
+                    for kp_idx in range(len(landmarks)):
+                        x, y, conf = landmarks[kp_idx]
+                        if conf >= 0.3:
+                            name = KEYPOINT_NAMES[kp_idx] if kp_idx < len(KEYPOINT_NAMES) else f"kp_{kp_idx}"
+                            writer.writerow([frame_idx, f"{time_sec:.4f}", "human", kp_idx, name, f"{x:.2f}", f"{y:.2f}"])
+
+                # Manual points
+                for pid, pos in manual_positions.items():
+                    writer.writerow([frame_idx, f"{time_sec:.4f}", "manual", pid, f"manual_{pid}", f"{pos[0]:.2f}", f"{pos[1]:.2f}"])
+
+        QMessageBox.information(self, "Exported", f"Tracking data saved to:\n{output_path}")
