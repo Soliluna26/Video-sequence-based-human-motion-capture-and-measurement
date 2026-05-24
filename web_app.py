@@ -19,24 +19,35 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# -- Force headless OpenCV (mediapipe pulls non-headless as a dependency,
-#    which fails on Debian Trixie due to missing libgthread-2.0.so.0) --
+# -- Force headless OpenCV variant --
+# mediapipe depends on opencv-contrib-python (non-headless), which requires
+# libgthread-2.0.so.0 — unavailable on Debian Trixie. We tell OpenCV's loader
+# to use the headless native library instead.
 os.environ["OPENCV_PYTHON_HEADLESS"] = "1"
 
-_FIX_FLAG = "/tmp/.mocap_headless_fix"
-if not os.path.exists(_FIX_FLAG):
-    for _pkg in ("opencv-contrib-python", "opencv-python"):
+try:
+    import cv2
+except ImportError:
+    # Env var alone wasn't enough — remove conflicting non-headless packages
+    _FIX_FLAG = "/tmp/.mocap_headless_fix"
+    if not os.path.exists(_FIX_FLAG):
+        for _pkg in ("opencv-contrib-python", "opencv-python"):
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", _pkg],
+                capture_output=True, timeout=30,
+            )
+        # Reinstall headless to restore any shared files pip may have removed
         subprocess.run(
-            [sys.executable, "-m", "pip", "uninstall", "-y", _pkg],
-            capture_output=True, timeout=30,
+            [sys.executable, "-m", "pip", "install", "--force-reinstall",
+             "--no-deps", "opencv-contrib-python-headless"],
+            capture_output=True, timeout=60,
         )
-    try:
-        with open(_FIX_FLAG, "w") as _f:
-            _f.write("1")
-    except OSError:
-        pass
-
-import cv2
+        try:
+            with open(_FIX_FLAG, "w") as _f:
+                _f.write("1")
+        except OSError:
+            pass
+    import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
