@@ -2,7 +2,6 @@
 # Core dependencies
 
 # Video / image processing
-opencv-python-headless>=4.8.0
 opencv-contrib-python-headless>=4.8.0
 Pillow>=10.0.0
 imageio>=2.31.0

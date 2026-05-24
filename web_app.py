@@ -11,11 +11,30 @@ Reuses all existing src/ modules without modification.
 import base64
 import io
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# -- Force headless OpenCV (mediapipe pulls non-headless as a dependency,
+#    which fails on Debian Trixie due to missing libgthread-2.0.so.0) --
+os.environ["OPENCV_PYTHON_HEADLESS"] = "1"
+
+_FIX_FLAG = "/tmp/.mocap_headless_fix"
+if not os.path.exists(_FIX_FLAG):
+    for _pkg in ("opencv-contrib-python", "opencv-python"):
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", _pkg],
+            capture_output=True, timeout=30,
+        )
+    try:
+        with open(_FIX_FLAG, "w") as _f:
+            _f.write("1")
+    except OSError:
+        pass
 
 import cv2
 import numpy as np
