@@ -1,8 +1,12 @@
 FROM python:3.11-slim-bullseye
 
-# System dependencies (libgl1 for OpenCV)
+# System dependencies for OpenCV + MediaPipe
 RUN apt-get update -qq \
-    && apt-get install -y -qq libgl1 libglib2.0-0 \
+    && apt-get install -y -qq \
+        libgl1 \
+        libglib2.0-0 \
+        libgles2 \
+        libegl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
