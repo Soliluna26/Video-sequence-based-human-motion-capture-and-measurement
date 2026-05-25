@@ -1,3 +1,12 @@
+---
+title: Motion Capture
+emoji: 🏃
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # Video-sequence-based Human Motion Capture and Measurement
 
 基于单目视频的人体运动捕捉与测量系统。输入任意视频，输出人体33个关节点的运动轨迹、关节角度/角速度/角加速度时序数据，支持手动打点追踪任意物体（如篮球），并支持纯黑背景的可视化回放与CSV轨迹导出。
