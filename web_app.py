@@ -121,6 +121,7 @@ def render_overlay_frame(
     ball_pos: Optional[Tuple[float, float]],
     manual_positions: Dict[int, Tuple[float, float]],
     manual_trajectories: Dict[int, List[Tuple[float, float]]],
+    ball_trajectory: List[Tuple[float, float]] | None = None,
     vel_mm_s: float = 0.0,
     dist_mm: float = 0.0,
     elapsed_s: float = 0.0,
@@ -131,6 +132,15 @@ def render_overlay_frame(
 
     if landmarks is not None:
         canvas = draw_skeleton(canvas, landmarks, CYAN)
+
+    # Ball trajectory (green)
+    if ball_trajectory and len(ball_trajectory) >= 2:
+        for i in range(1, len(ball_trajectory)):
+            x1, y1 = ball_trajectory[i - 1]
+            x2, y2 = ball_trajectory[i]
+            p1 = (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1)))
+            p2 = (int(np.clip(x2, 0, w - 1)), int(np.clip(y2, 0, h - 1)))
+            cv2.line(canvas, p1, p2, GREEN, 2)
 
     canvas = draw_trajectories(canvas, manual_trajectories, BLUE)
 
@@ -169,29 +179,51 @@ def render_replay_frame(
     landmarks: Optional[PoseResult],
     manual_positions: Dict[int, Tuple[float, float]],
     manual_trajectories: Dict[int, List[Tuple[float, float]]],
+    ball_positions: List[Optional[Tuple[float, float]]],
+    ball_trajectory: List[Tuple[float, float]],
     vel_mm_s: float = 0.0,
     dist_mm: float = 0.0,
     elapsed_s: float = 0.0,
 ) -> np.ndarray:
-    """Render a replay frame on black background with trajectories."""
+    """Render a replay frame on black background with all trajectories."""
     h, w = frame_bgr.shape[:2]
     canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
     if landmarks is not None:
         canvas = draw_skeleton(canvas, landmarks, CYAN)
 
-    canvas = draw_trajectories(canvas, manual_trajectories, BLUE)
+    # Ball trajectory (green)
+    if len(ball_trajectory) >= 2:
+        for i in range(1, len(ball_trajectory)):
+            x1, y1 = ball_trajectory[i - 1]
+            x2, y2 = ball_trajectory[i]
+            p1 = (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1)))
+            p2 = (int(np.clip(x2, 0, w - 1)), int(np.clip(y2, 0, h - 1)))
+            cv2.line(canvas, p1, p2, GREEN, 2)
+    # Current ball position
+    for bp in reversed(ball_positions):
+        if bp is not None:
+            bx, by = int(np.clip(bp[0], 0, w - 1)), int(np.clip(bp[1], 0, h - 1))
+            cv2.circle(canvas, (bx, by), 10, GREEN, -1)
+            cv2.circle(canvas, (bx, by), 14, GREEN, 2)
+            break
+    # Ball sampling dots
+    for px, py in ball_trajectory:
+        cx, cy = int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1))
+        cv2.circle(canvas, (cx, cy), 3, GREEN, -1)
 
+    # Manual point trajectories (blue)
+    canvas = draw_trajectories(canvas, manual_trajectories, BLUE)
     for pid, pos in manual_positions.items():
         px, py = int(np.clip(pos[0], 0, w - 1)), int(np.clip(pos[1], 0, h - 1))
         cv2.circle(canvas, (px, py), 6, BLUE, -1)
         cv2.circle(canvas, (px, py), 9, BLUE, 2)
-
     for pid, pts in manual_trajectories.items():
         for px, py in pts:
             cx, cy = int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1))
             cv2.circle(canvas, (cx, cy), 3, BLUE, -1)
 
+    # Measurements
     lines = [
         f"Velocity: {vel_mm_s:.2f} mm/s",
         f"Distance: {dist_mm:.2f} mm",
@@ -306,13 +338,16 @@ def generate_replay_video(
     fps: float,
     mm_per_pixel: float = DEFAULT_MM_PER_PIXEL,
 ) -> bytes:
-    """Generate a replay MP4 video with skeleton and trajectories. Returns bytes."""
+    """Generate a replay MP4 video with skeleton, ball, and trajectories."""
     if not frames_bgr:
         return b""
     h, w = frames_bgr[0].shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     tmp_path = os.path.join(tempfile.gettempdir(), "mocap_replay.mp4")
     writer = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
+
+    # Accumulate ball trajectory frame by frame
+    ball_traj: List[Tuple[float, float]] = []
 
     for fi, frame_bgr in enumerate(frames_bgr):
         manual_pos = {}
@@ -322,11 +357,19 @@ def generate_replay_video(
                     manual_pos[pid] = (x, y)
                     break
 
+        # Ball trajectory
+        bp = ball_positions[fi] if fi < len(ball_positions) else None
+        if bp is not None:
+            ball_traj.append(bp)
+        ball_pos_snapshot = [ball_positions[fi] if fi < len(ball_positions) else None]
+
         traj = build_manual_trajectories_up_to(manual_tracks, fi)
         vel, dist, elapsed = calc_ball_metrics(ball_positions, fi, fps, mm_per_pixel)
 
         canvas = render_replay_frame(
-            frame_bgr, poses[fi], manual_pos, traj, vel, dist, elapsed,
+            frame_bgr, poses[fi], manual_pos, traj,
+            ball_pos_snapshot, list(ball_traj),
+            vel, dist, elapsed,
         )
         writer.write(canvas)
 
@@ -582,11 +625,38 @@ def main():
         return
 
     st.markdown("### Frame Viewer")
-    frame_slider = st.slider(
-        "Navigate frames", 0, T - 1, ss.current_frame, 1,
-        key="frame_nav",
-    )
-    ss.current_frame = frame_slider
+
+    # Playback controls
+    c_slider, c_play, c_pause, c_speed = st.columns([3, 0.7, 0.7, 1])
+    with c_slider:
+        frame_slider = st.slider(
+            "Frame", 0, T - 1, ss.current_frame, 1,
+            key="frame_nav", label_visibility="collapsed",
+        )
+        ss.current_frame = frame_slider
+    with c_speed:
+        play_fps = st.number_input(
+            "FPS", 1, 60, getattr(ss, "play_fps", 10), 1,
+            key="play_fps_input",
+        )
+        ss.play_fps = play_fps
+    with c_play:
+        if st.button("▶", key="btn_play", help="Play", use_container_width=True):
+            ss.play_mode = True
+    with c_pause:
+        if st.button("⏸", key="btn_pause", help="Pause", use_container_width=True):
+            ss.play_mode = False
+
+    # Auto-advance when playing
+    if getattr(ss, "play_mode", False):
+        if ss.current_frame < T - 1:
+            ss.current_frame += 1
+            import time as _time
+            _time.sleep(1.0 / max(ss.play_fps, 1))
+            st.rerun()
+        else:
+            ss.play_mode = False
+            st.rerun()
 
     frame_bgr = ss.frames_bgr[frame_slider]
     landmarks = ss.poses[frame_slider] if frame_slider < len(ss.poses) else None
@@ -602,9 +672,13 @@ def main():
 
     traj_up_to = build_manual_trajectories_up_to(ss.manual_tracks, frame_slider)
 
+    # Build ball trajectory up to current frame
+    ball_traj = [(p[0], p[1]) for p in ss.ball_positions[:frame_slider + 1] if p is not None]
+
     overlaid = render_overlay_frame(
         frame_bgr, landmarks, ball_pos, manual_pos, traj_up_to,
-        vel, dist, elapsed,
+        ball_trajectory=ball_traj,
+        vel_mm_s=vel, dist_mm=dist, elapsed_s=elapsed,
     )
 
     col_img, col_info = st.columns([3, 1])
@@ -663,14 +737,14 @@ def main():
                 ss.manual_tracks, ss.fps, mm_per_pixel,
             )
         if video_data:
+            st.success("Replay video ready!")
+            st.video(video_data)
             st.download_button(
                 "⬇ Download Replay Video",
                 video_data,
                 file_name="mocap_replay.mp4",
                 mime="video/mp4",
-                use_container_width=True,
             )
-            st.success("Replay video ready! Click above to download.")
         else:
             st.error("Failed to generate video.")
 
