@@ -1,0 +1,24 @@
+name: Deploy to HuggingFace Space
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Push clean build to HuggingFace Space
+        run: |
+          # Create orphan branch with clean history (HF rejects files >10MB)
+          git checkout --orphan hf-deploy
+          git rm -rf --cached .
+          git checkout ${{ github.sha }} -- .
+          # Stage everything
+          git add -A
+          git commit -m "Deploy ${{ github.sha }}"
+          # Push to HF
+          git remote add hf https://Hello532:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/Hello532/motion-capture
+          git push --force hf hf-deploy:main
