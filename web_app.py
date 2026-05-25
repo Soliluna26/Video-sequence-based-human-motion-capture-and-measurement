@@ -68,78 +68,102 @@ def _gthread_setup() -> bool:
 
 
 def _gthread_try_apt() -> bool:
-    """Try: apt-get download libglib2.0-0/bullseye, extract .so."""
+    """Use apt-get -o to download libglib2.0-0 from bullseye into /tmp."""
     deb_path = _GTHREAD_DIR + "/._apt_libglib.deb"
-    bullseye_sources = [
-        "deb http://archive.debian.org/debian bullseye main",
-        "deb http://deb.debian.org/debian bullseye main",
-    ]
-    sources_path = "/etc/apt/sources.list.d/mocap_bullseye.list"
+    src_list = _GTHREAD_DIR + "/bullseye.list"
+    apt_lists = _GTHREAD_DIR + "/apt-lists"
+    apt_cache = _GTHREAD_DIR + "/apt-cache"
+
     try:
-        # Add bullseye source temporarily
-        with open(sources_path, "w") as f:
-            for src in bullseye_sources:
-                f.write(src + "\n")
+        # Write a custom sources.list in /tmp (writable)
+        with open(src_list, "w") as f:
+            f.write("deb http://archive.debian.org/debian bullseye main\n")
+
+        os.makedirs(apt_lists + "/partial", exist_ok=True)
+        os.makedirs(apt_cache, exist_ok=True)
+
+        _apt_opts = [
+            "-o", f"Dir::Etc::sourcelist={src_list}",
+            "-o", "Dir::Etc::sourceparts=-",  # disable default sources
+            "-o", f"Dir::State::lists={apt_lists}",
+            "-o", f"Dir::Cache={apt_cache}",
+            "-o", "APT::Get::AllowUnauthenticated=true",
+            "-o", "Acquire::AllowInsecureRepositories=true",
+            "-o", "Acquire::AllowDowngradeToInsecureRepositories=true",
+        ]
+
         _sp.run(
-            ["apt-get", "update", "-qq"],
-            capture_output=True, timeout=60,
+            ["apt-get"] + _apt_opts + ["update", "-qq"],
+            capture_output=True, timeout=120,
         )
+
+        # Find the available version
+        madison = _sp.run(
+            ["apt-cache"] + _apt_opts + ["madison", "libglib2.0-0"],
+            capture_output=True, text=True, timeout=30,
+        )
+        _gthread_log(f"Available versions: {madison.stdout.strip()}")
+
         result = _sp.run(
-            ["apt-get", "download", "-qq", "libglib2.0-0/bullseye"],
-            capture_output=True, timeout=60, cwd=_GTHREAD_DIR,
+            ["apt-get"] + _apt_opts + ["download", "-qq", "libglib2.0-0"],
+            capture_output=True, timeout=120, cwd=_GTHREAD_DIR,
         )
         if result.returncode != 0:
-            _gthread_log(f"apt-get download failed: {result.stderr.decode()}")
+            err = result.stderr.decode(errors="replace")[:300]
+            _gthread_log(f"apt-get download failed: {err}")
             return False
-        # Find downloaded .deb
+
+        # Find the downloaded .deb (version is dynamic)
         for fn in os.listdir(_GTHREAD_DIR):
             if fn.startswith("libglib2.0-0_") and fn.endswith("_amd64.deb"):
-                os.rename(os.path.join(_GTHREAD_DIR, fn), deb_path)
-                break
-        if not os.path.exists(deb_path) or os.path.getsize(deb_path) < 500_000:
-            _gthread_log("apt-get didn't produce a valid .deb")
-            return False
-        _gthread_log(f"Downloaded .deb via apt: {os.path.getsize(deb_path)} bytes")
-        return _gthread_unpack_deb(deb_path)
+                src = os.path.join(_GTHREAD_DIR, fn)
+                os.rename(src, deb_path)
+                _gthread_log(f"Downloaded via apt: {fn} ({os.path.getsize(deb_path)} bytes)")
+                return _gthread_unpack_deb(deb_path)
+
+        _gthread_log("apt-get ran but no .deb found in output dir")
+        return False
     except Exception as e:
         _gthread_log(f"apt strategy exception: {e}")
         return False
     finally:
-        for p in (deb_path, sources_path):
+        for p in (deb_path, src_list):
             if os.path.exists(p):
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
+        shutil.rmtree(apt_lists, ignore_errors=True)
+        shutil.rmtree(apt_cache, ignore_errors=True)
 
 
 def _gthread_try_http() -> bool:
-    """Try: download .deb from Debian archive mirrors via HTTP."""
-    # Multiple version numbers to try (we don't know the exact bullseye rev)
-    _VERSIONS = [
-        "2.66.8-1+deb11u1",
-        "2.66.8-1+deb11u8",
-        "2.66.8-1+deb11u11",
-        "2.66.8-1",
-    ]
-    _HOSTS = [
-        "http://archive.debian.org/debian",
-        "http://deb.debian.org/debian",
-    ]
+    """Fallback: download .deb via HTTP from Debian snapshot/archive."""
     deb_path = _GTHREAD_DIR + "/._http_libglib.deb"
-    for host in _HOSTS:
-        for ver in _VERSIONS:
-            url = f"{host}/pool/main/g/glib2.0/libglib2.0-0_{ver}_amd64.deb"
-            _gthread_log(f"Trying {url} ...")
-            try:
-                _request.urlretrieve(url, deb_path)
-                sz = os.path.getsize(deb_path)
-                _gthread_log(f"Got {sz} bytes")
-                if sz > 500_000:
-                    return _gthread_unpack_deb(deb_path)
-            except Exception as e:
-                _gthread_log(f"HTTP error: {e}")
-                continue
+    # snapshot.debian.org has every version; archive.debian.org has the final one
+    _URLS = [
+        # First try: snapshot with a known bullseye version (2.66.8-1+deb11u1)
+        "https://snapshot.debian.org/archive/debian/20230320T024800Z"
+        "/pool/main/g/glib2.0/libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
+        # Second try: archive.debian.org (Debian archive)
+        "http://archive.debian.org/debian/pool/main/g/glib2.0/"
+        "libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
+        "http://archive.debian.org/debian/pool/main/g/glib2.0/"
+        "libglib2.0-0_2.66.8-1_amd64.deb",
+        # Third try: generic snapshot (try to list directory)
+        "https://snapshot.debian.org/archive/debian/20230101T000000Z"
+        "/pool/main/g/glib2.0/libglib2.0-0_2.66.8-1_amd64.deb",
+    ]
+    for url in _URLS:
+        _gthread_log(f"Trying {url} ...")
+        try:
+            _request.urlretrieve(url, deb_path)
+            sz = os.path.getsize(deb_path)
+            if sz > 500_000:
+                return _gthread_unpack_deb(deb_path)
+            _gthread_log(f"Too small ({sz} bytes), likely an error page")
+        except Exception as e:
+            _gthread_log(f"HTTP error: {e}")
     return False
 
 
