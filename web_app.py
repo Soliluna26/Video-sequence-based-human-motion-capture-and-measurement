@@ -472,6 +472,22 @@ def main():
     init_session_state()
     ss = st.session_state
 
+    # -- Reset handler --
+    if getattr(ss, "_do_reset", False):
+        for _k in list(ss.keys()):
+            del ss[_k]
+        st.rerun()
+
+    # -- Convenience: _s(key, default) --
+    def _s(key, default=None):
+        if key not in ss:
+            ss[key] = default
+        return ss[key]
+
+    # -- Determine app mode --
+    app_mode = _s("app_mode", "idle")
+    has_video = bool(_s("video_path", ""))
+
     # -- Sidebar --
     with st.sidebar:
         st.title("🏃 Motion Capture")
@@ -485,232 +501,264 @@ def main():
             key="video_uploader",
         )
         if uploaded is not None:
-            if ss.video_name != uploaded.name:
+            if _s("video_name", "") != uploaded.name:
                 ss.video_name = uploaded.name
-                ss.processing_done = False
+                ss.app_mode = "ready"
+                ss.video_path = None
                 ss.frames_bgr = []
                 ss.frames_gray = []
                 ss.poses = []
                 ss.ball_positions = []
                 ss.manual_tracks = {}
                 ss.next_manual_id = 0
-                ss.pending_manual_points = {}
                 ss.current_frame = 0
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix)
+                ss.processing_done = False
+                ss.play_mode = False
+                ss.frame_idx = 0
+                ss._preview_frame = None
+                ss._replay_data = None
+                # Save video to temp
+                tmp = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=Path(uploaded.name).suffix,
+                )
                 tmp.write(uploaded.read())
                 tmp.close()
                 ss.video_path = tmp.name
+                # Grab first frame for preview
                 cap = cv2.VideoCapture(ss.video_path)
                 if cap.isOpened():
                     ss.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                     ss.frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    ret, preview = cap.read()
+                    if ret:
+                        ss._preview_frame = preview
                 cap.release()
+                st.rerun()
 
-        if ss.video_path:
-            st.caption(f"File: {ss.video_name}")
-            st.caption(f"Frames: {ss.frame_count} @ {ss.fps:.1f} fps")
+        if has_video:
+            st.caption(f"File: {_s('video_name')}")
+            st.caption(f"Frames: {_s('frame_count')} @ {_s('fps', 30):.1f} fps")
 
         st.divider()
         st.subheader("2. Settings")
         max_frames = st.number_input(
-            "Max frames", min_value=10, max_value=2000,
-            value=DEFAULT_MAX_FRAMES, step=10,
-            help="Limit frames to process (saves memory).",
+            "Max frames", 10, 2000, DEFAULT_MAX_FRAMES, 10,
+            help="Limit frames to process.",
         )
         mm_per_pixel = st.number_input(
-            "Scale (mm/pixel)", min_value=0.1, max_value=100.0,
-            value=DEFAULT_MM_PER_PIXEL, step=0.1,
-            help="Conversion factor from pixels to millimeters.",
+            "Scale (mm/pixel)", 0.1, 100.0, DEFAULT_MM_PER_PIXEL, 0.1,
+            help="Pixels to millimeters conversion.",
         )
 
+        # -- Buttons depend on mode --
         st.divider()
-        st.subheader("3. Process")
-        do_process = st.button(
-            "▶ Start Processing", type="primary",
-            disabled=not ss.video_path,
-            use_container_width=True,
-        )
+        st.subheader("3. Controls")
 
-        if ss.processing_done:
+        if app_mode == "ready":
+            if st.button("▶ Start", type="primary",
+                         use_container_width=True, key="btn_start"):
+                ss.app_mode = "processing"
+                st.rerun()
+
+        if app_mode == "done":
             st.success(f"Processed {len(ss.poses)} frames")
-
-        st.divider()
-        st.subheader("4. Controls")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button(
-                "🎬 Replay Video", disabled=not ss.processing_done,
-                use_container_width=True, key="btn_replay",
-            ):
+            if st.button("🎬 Replay Video", use_container_width=True, key="btn_replay"):
                 ss._do_replay = True
+                ss._replay_data = None
                 st.rerun()
-        with col_b:
-            export_csv_btn = st.button(
-                "📊 CSV Data", disabled=not ss.processing_done,
-                use_container_width=True, key="btn_csv",
-            )
-
-        if ss.processing_done:
-            if st.button("🔄 Reset All", use_container_width=True, key="btn_reset"):
-                ss._do_reset = True
-                st.rerun()
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("📊 CSV Data", use_container_width=True, key="btn_csv"):
+                    ss._do_csv = True
+                    st.rerun()
+            with col_b:
+                if st.button("🔄 Reset All", use_container_width=True, key="btn_reset"):
+                    ss._do_reset = True
+                    st.rerun()
 
         st.divider()
         st.caption("Powered by MediaPipe + OpenCV")
 
-    # -- Processing --
-    if do_process and ss.video_path:
-        ss._needs_replay = False  # clear cached replay
+    # ================================================================
+    # Processing mode
+    # ================================================================
+    if app_mode == "processing" and has_video:
         with st.spinner("Loading frames..."):
             loader = FrameLoader(ss.video_path, max_frames=max_frames)
             ss.fps = loader.fps
             frames = loader.load_frames()
             T = len(frames)
-
             ss.frames_bgr = [frames[i] for i in range(T)]
             ss.frames_gray = [
                 cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY) for i in range(T)
             ]
             del frames
 
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
+        pb = st.progress(0.0)
+        sts = st.empty()
 
-        status_text.text("Running pose estimation...")
+        sts.text("Running pose estimation...")
         estimator = get_pose_estimator()
         ss.poses = []
         for i in range(T):
-            pose = estimator.process_frame(ss.frames_bgr[i])
-            ss.poses.append(pose)
-            progress_bar.progress((i + 1) / (T * 2))
+            ss.poses.append(estimator.process_frame(ss.frames_bgr[i]))
+            pb.progress((i + 1) / (T * 2))
 
-        status_text.text("Running ball tracking...")
-        ball_tracker = BallTracker()
+        sts.text("Running ball tracking...")
+        bt = BallTracker()
         ss.ball_positions = []
         for i in range(T):
-            bp = ball_tracker.detect(ss.frames_bgr[i])
-            ss.ball_positions.append(bp)
-            progress_bar.progress(0.5 + (i + 1) / (T * 2))
+            ss.ball_positions.append(bt.detect(ss.frames_bgr[i]))
+            pb.progress(0.5 + (i + 1) / (T * 2))
+
+        estimator.release()
+
+        # Track pending manual points from preview
+        pending = _s("_pending_pts", [])
+        for pid, px, py in pending:
+            tracks = run_optical_flow_tracking(
+                ss.frames_gray, 0, {pid: (px, py)},
+            )
+            ss.manual_tracks[pid] = tracks[pid]
+            if pid >= ss.next_manual_id:
+                ss.next_manual_id = pid + 1
+        ss._pending_pts = []
 
         ss.frame_count = T
         ss.current_frame = 0
-        ss.processing_done = True
-        ss.manual_tracks = {}
-        ss.next_manual_id = 0
-        ss.pending_manual_points = {}
+        ss.frame_idx = 0
         ss.play_mode = False
+        ss.app_mode = "done"
+        ss._do_replay = False
+        ss._replay_data = None
 
-        estimator.release()
-        progress_bar.empty()
-        status_text.empty()
-        st.success(f"Done! Processed {T} frames. Navigate frames below.")
+        pb.empty()
+        sts.empty()
+        st.success(f"Done! Processed {T} frames.")
         st.rerun()
 
-    # -- Reset --
-    if getattr(ss, "_do_reset", False):
-        for _k in list(ss.keys()):
-            del ss[_k]
-        st.rerun()
+    # ================================================================
+    # Ready mode — show preview + manual point adding
+    # ================================================================
+    if app_mode == "ready":
+        st.markdown("### Video Preview")
+        st.info("Add manual tracking points now, or click **Start** to process the video.")
 
-    if ss.processing_error:
-        st.error(ss.processing_error)
-        ss.processing_error = None
+        preview_frame = _s("_preview_frame")
+        if preview_frame is not None:
+            h, w = preview_frame.shape[:2]
 
-    if not ss.processing_done:
+            # Show clickable preview
+            pt_mode = st.checkbox("🎯 Point Mode", key="pt_ready",
+                                  help="Check to enable clicking on the preview")
+            ss._pt_ready = pt_mode
+
+            if pt_mode:
+                click_result = clickable_image(preview_frame, "preview")
+                if click_result and isinstance(click_result, dict) and "x" in click_result:
+                    px, py = int(click_result["x"]), int(click_result["y"])
+                    pid = ss.next_manual_id
+                    ss.next_manual_id += 1
+                    # Save as pending — will be tracked during Start processing
+                    _pending = _s("_pending_pts", [])
+                    _pending.append((pid, float(px), float(py)))
+                    ss._pending_pts = _pending
+                    st.toast(f"Point #{pid} added on preview", icon="✅")
+                    st.rerun()
+            else:
+                rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+                st.image(rgb, use_container_width=True)
+
+            # List pending points
+            pending = _s("_pending_pts", [])
+            if pending:
+                st.markdown("**Pending Points (tracked when Start is clicked):**")
+                for pid, px, py in pending:
+                    st.caption(f"#{pid}: ({px:.0f}, {py:.0f})")
+                    if st.button("✕", key=f"del_pend_{pid}"):
+                        ss._pending_pts = [(p, x, y) for p, x, y in pending if p != pid]
+                        st.rerun()
+        return
+
+    # ================================================================
+    # DONE mode — results
+    # ================================================================
+    if app_mode != "done":
+        # Idle or unknown — show welcome
         st.markdown("""
         ## Welcome to Human Motion Capture & Measurement
 
-        This web interface lets you analyze human motion from video **without downloading any files**.
-
-        ### How to use:
-        1. **Upload a video** using the sidebar (mp4, avi, mov, gif, webm)
-        2. **Adjust settings** — limit frames for faster processing
-        3. **Click "Start Processing"** to run pose estimation and tracking
-        4. **View results** frame-by-frame with skeleton overlay
-        5. **Toggle "Point Mode"** to click on the video and add tracking points
-        6. **Export** the replay video or CSV data
-
-        ---
-        Upload a video to begin.
+        1. Upload a video
+        2. (Optional) Add manual points on the preview
+        3. Click **Start** to process
+        4. Frame Viewer, Replay Video, CSV Export
         """)
         return
 
-    T = ss.frame_count
+    T = _s("frame_count", 0)
     if T == 0:
         return
 
-    # -- Replay video generation (runs first when button clicked) --
+    # --- Replay generation ---
     if getattr(ss, "_do_replay", False):
         ss._do_replay = False
         with st.spinner("Generating replay video..."):
-            video_data = generate_replay_video(
+            vdata = generate_replay_video(
                 ss.frames_bgr, ss.poses, ss.ball_positions,
                 ss.manual_tracks, ss.fps, mm_per_pixel,
             )
-        if video_data:
-            ss._replay_data = video_data
-            st.success("Replay video ready!")
+        if vdata:
+            # Write to temp file for st.video (more reliable than bytes)
+            _rp = os.path.join(tempfile.gettempdir(), "mocap_replay.mp4")
+            with open(_rp, "wb") as f:
+                f.write(vdata)
+            ss._replay_path = _rp
+            ss._replay_data = vdata
         else:
             st.error("Failed to generate video.")
 
-    # Show cached replay video
-    if getattr(ss, "_replay_data", None):
+    # --- Show replay video ---
+    if getattr(ss, "_replay_path", None):
         st.markdown("### Replay Video")
-        st.video(ss._replay_data)
-        st.download_button(
-            "⬇ Download Replay Video",
-            ss._replay_data,
-            file_name="mocap_replay.mp4",
-            mime="video/mp4",
-        )
-        if st.button("✕ Close Replay", key="close_replay"):
-            ss._replay_data = None
-            st.rerun()
+        st.video(ss._replay_path)
+        col_r1, col_r2 = st.columns([1, 1])
+        with col_r1:
+            st.download_button(
+                "⬇ Download", ss._replay_data,
+                file_name="mocap_replay.mp4", mime="video/mp4",
+            )
+        with col_r2:
+            if st.button("✕ Close Replay", key="close_replay"):
+                ss._replay_path = None
+                ss._replay_data = None
+                st.rerun()
         st.divider()
 
+    # --- Frame Viewer ---
     st.markdown("### Frame Viewer")
 
-    # Point mode toggle + color legend
-    col_pt, col_leg = st.columns([1, 3])
-    with col_pt:
-        point_mode = st.checkbox(
-            "🎯 Point Mode",
-            value=getattr(ss, "point_mode", False),
-            key="point_mode_cb",
-            help="Toggle ON then click on the frame to add tracking points",
-        )
-        ss.point_mode = point_mode
-    with col_leg:
-        if point_mode:
-            st.info("Click on the image to add a point — it will be auto-tracked (🟢 ball, 🔵 manual)")
-        else:
-            st.caption("Toggle Point Mode to add tracking markers")
+    # Point mode
+    pt_mode = st.checkbox("🎯 Point Mode", key="pt_done",
+                          help="Click on frame to add tracking points (🔵 manual, 🟢 ball)")
+    ss.point_mode = pt_mode
 
-    # Playback controls
-    c_slider, c_play, c_speed = st.columns([4, 0.8, 1])
-    with c_slider:
-        # Use session_state directly to avoid slider/session conflict
-        if "frame_idx" not in ss:
-            ss.frame_idx = ss.current_frame
-        ss.frame_idx = st.slider(
-            "Frame", 0, T - 1, ss.frame_idx, 1,
-            key="frame_slider",
-        )
-    with c_speed:
-        play_fps = st.number_input(
-            "FPS", 1, 60, getattr(ss, "play_fps", 10), 1,
-            key="play_fps_inp",
-        )
-        ss.play_fps = play_fps
-    with c_play:
-        is_playing = getattr(ss, "play_mode", False)
-        if st.button("⏸" if is_playing else "▶", key="btn_playpause", help="Play/Pause", use_container_width=True):
-            ss.play_mode = not is_playing
-            if ss.play_mode:
-                ss.frame_idx = ss.frame_idx  # start from current frame
+    # Playback row
+    c1, c2, c3 = st.columns([3, 1, 1])
+    with c1:
+        fidx = _s("frame_idx", 0)
+        fidx = st.slider("Frame", 0, T - 1, fidx, 1, key="fslider",
+                         label_visibility="collapsed")
+        ss.frame_idx = fidx
+    with c2:
+        fps_val = st.number_input("FPS", 1, 60, _s("play_fps", 10), 1, key="fpsinp")
+        ss.play_fps = fps_val
+    with c3:
+        playing = _s("play_mode", False)
+        if st.button("⏸" if playing else "▶", key="playbtn", use_container_width=True):
+            ss.play_mode = not playing
 
-    # Auto-advance loop
-    if getattr(ss, "play_mode", False):
+    # Play loop
+    if _s("play_mode", False):
         if ss.frame_idx < T - 1:
             ss.frame_idx += 1
             time.sleep(1.0 / max(ss.play_fps, 1))
@@ -719,23 +767,22 @@ def main():
             ss.play_mode = False
             st.rerun()
 
-    frame_idx = ss.frame_idx
-    ss.current_frame = frame_idx
+    fidx = ss.frame_idx
 
-    frame_bgr = ss.frames_bgr[frame_idx]
-    landmarks = ss.poses[frame_idx] if frame_idx < len(ss.poses) else None
-    ball_pos = ss.ball_positions[frame_idx] if frame_idx < len(ss.ball_positions) else None
-    vel, dist, elapsed = calc_ball_metrics(ss.ball_positions, frame_idx, ss.fps, mm_per_pixel)
+    frame_bgr = ss.frames_bgr[fidx]
+    landmarks = ss.poses[fidx] if fidx < len(ss.poses) else None
+    ball_pos = ss.ball_positions[fidx] if fidx < len(ss.ball_positions) else None
+    vel, dist, elapsed = calc_ball_metrics(ss.ball_positions, fidx, ss.fps, mm_per_pixel)
 
     manual_pos: Dict[int, Tuple[float, float]] = {}
     for pid, history in ss.manual_tracks.items():
-        for f_idx, x, y in history:
-            if f_idx == frame_idx:
+        for fi, x, y in history:
+            if fi == fidx:
                 manual_pos[pid] = (x, y)
                 break
 
-    traj_up_to = build_manual_trajectories_up_to(ss.manual_tracks, frame_idx)
-    ball_traj = [(p[0], p[1]) for p in ss.ball_positions[:frame_idx + 1] if p is not None]
+    traj_up_to = build_manual_trajectories_up_to(ss.manual_tracks, fidx)
+    ball_traj = [(p[0], p[1]) for p in ss.ball_positions[:fidx + 1] if p is not None]
 
     overlaid = render_overlay_frame(
         frame_bgr, landmarks, ball_pos, manual_pos, traj_up_to,
@@ -744,63 +791,59 @@ def main():
     )
 
     col_img, col_info = st.columns([3, 1])
-
     with col_img:
         if getattr(ss, "point_mode", False):
-            click_result = clickable_image(overlaid, f"f{frame_idx}")
+            click_result = clickable_image(overlaid, f"f{fidx}")
             if click_result and isinstance(click_result, dict) and "x" in click_result:
                 px, py = int(click_result["x"]), int(click_result["y"])
                 pid = ss.next_manual_id
                 ss.next_manual_id += 1
-                initial = {pid: (float(px), float(py))}
                 tracks = run_optical_flow_tracking(
-                    ss.frames_gray, frame_idx, initial,
+                    ss.frames_gray, fidx, {pid: (float(px), float(py))},
                 )
                 ss.manual_tracks[pid] = tracks[pid]
-                st.toast(f"Point #{pid} added and tracked!", icon="✅")
+                st.toast(f"Point #{pid} tracked!", icon="✅")
                 st.rerun()
         else:
             rgb = cv2.cvtColor(overlaid, cv2.COLOR_BGR2RGB)
             st.image(rgb, use_container_width=True)
 
     with col_info:
-        st.metric("Frame", f"{frame_idx} / {T - 1}")
+        st.metric("Frame", f"{fidx} / {T - 1}")
         st.metric("Time", f"{elapsed:.2f} s")
         st.metric("Velocity", f"{vel:.2f} mm/s")
         st.metric("Distance", f"{dist:.2f} mm")
-
         if landmarks is not None:
-            detected_kps = sum(1 for lm in landmarks if lm[2] >= 0.3)
-            st.caption(f"Keypoints detected: {detected_kps}/33")
+            nk = sum(1 for lm in landmarks if lm[2] >= 0.3)
+            st.caption(f"Keypoints: {nk}/33")
         if ball_pos is not None:
             st.caption(f"Ball: ({ball_pos[0]:.0f}, {ball_pos[1]:.0f})")
-
         if ss.manual_tracks:
             st.divider()
             st.markdown("**Manual Points**")
             for pid in sorted(ss.manual_tracks.keys()):
-                history = ss.manual_tracks[pid]
-                tracked_frames = len(history)
-                col_pt, col_del = st.columns([3, 1])
-                with col_pt:
-                    st.caption(f"#{pid}: {tracked_frames} frames tracked")
-                with col_del:
+                h = ss.manual_tracks[pid]
+                cp, cd = st.columns([3, 1])
+                with cp:
+                    st.caption(f"#{pid}: {len(h)} frames")
+                with cd:
                     if st.button("X", key=f"del_{pid}"):
                         del ss.manual_tracks[pid]
                         st.rerun()
 
     st.divider()
     if getattr(ss, "point_mode", False):
-        st.info("Point Mode ON — click on the image above to add tracking points")
+        st.info("Point Mode ON — click image to add tracking points")
     else:
-        st.caption("Enable Point Mode above to add tracking markers")
+        st.caption("Check Point Mode to add tracking markers")
 
-    # -- Export CSV --
-    if export_csv_btn:
+    # --- CSV Export ---
+    if getattr(ss, "_do_csv", False):
+        ss._do_csv = False
         import csv as csv_mod
         buf = io.StringIO()
-        writer = csv_mod.writer(buf)
-        writer.writerow(["frame_idx", "time_sec", "point_type", "point_id", "name", "x", "y"])
+        w = csv_mod.writer(buf)
+        w.writerow(["frame_idx", "time_sec", "point_type", "point_id", "name", "x", "y"])
         for fi in range(T):
             t = fi / ss.fps if ss.fps > 0 else 0.0
             pose = ss.poses[fi] if fi < len(ss.poses) else None
@@ -809,17 +852,15 @@ def main():
                     x, y, conf = pose[ki]
                     if conf >= 0.3:
                         name = KEYPOINT_NAMES[ki] if ki < len(KEYPOINT_NAMES) else f"kp_{ki}"
-                        writer.writerow([fi, f"{t:.4f}", "human", ki, name, f"{x:.2f}", f"{y:.2f}"])
+                        w.writerow([fi, f"{t:.4f}", "human", ki, name, f"{x:.2f}", f"{y:.2f}"])
             for pid, history in ss.manual_tracks.items():
                 for f_idx, mx, my in history:
                     if f_idx == fi:
-                        writer.writerow([fi, f"{t:.4f}", "manual", pid, f"manual_{pid}", f"{mx:.2f}", f"{my:.2f}"])
+                        w.writerow([fi, f"{t:.4f}", "manual", pid, f"manual_{pid}", f"{mx:.2f}", f"{my:.2f}"])
                         break
         st.download_button(
-            "⬇ Download CSV Data",
-            buf.getvalue(),
-            file_name="mocap_tracking.csv",
-            mime="text/csv",
+            "⬇ Download CSV", buf.getvalue(),
+            file_name="mocap_tracking.csv", mime="text/csv",
             use_container_width=True,
         )
 
