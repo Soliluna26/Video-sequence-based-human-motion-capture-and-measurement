@@ -535,24 +535,32 @@ def main():
             st.success(f"Processed {len(ss.poses)} frames")
 
         st.divider()
-        st.subheader("4. Export")
+        st.subheader("4. Controls")
         col_a, col_b = st.columns(2)
         with col_a:
-            export_video_btn = st.button(
+            if st.button(
                 "🎬 Replay Video", disabled=not ss.processing_done,
-                use_container_width=True,
-            )
+                use_container_width=True, key="btn_replay",
+            ):
+                ss._do_replay = True
+                st.rerun()
         with col_b:
             export_csv_btn = st.button(
                 "📊 CSV Data", disabled=not ss.processing_done,
-                use_container_width=True,
+                use_container_width=True, key="btn_csv",
             )
+
+        if ss.processing_done:
+            if st.button("🔄 Reset All", use_container_width=True, key="btn_reset"):
+                ss._do_reset = True
+                st.rerun()
 
         st.divider()
         st.caption("Powered by MediaPipe + OpenCV")
 
     # -- Processing --
     if do_process and ss.video_path:
+        ss._needs_replay = False  # clear cached replay
         with st.spinner("Loading frames..."):
             loader = FrameLoader(ss.video_path, max_frames=max_frames)
             ss.fps = loader.fps
@@ -590,11 +598,18 @@ def main():
         ss.manual_tracks = {}
         ss.next_manual_id = 0
         ss.pending_manual_points = {}
+        ss.play_mode = False
 
         estimator.release()
         progress_bar.empty()
         status_text.empty()
         st.success(f"Done! Processed {T} frames. Navigate frames below.")
+        st.rerun()
+
+    # -- Reset --
+    if getattr(ss, "_do_reset", False):
+        for _k in list(ss.keys()):
+            del ss[_k]
         st.rerun()
 
     if ss.processing_error:
@@ -612,7 +627,7 @@ def main():
         2. **Adjust settings** — limit frames for faster processing
         3. **Click "Start Processing"** to run pose estimation and tracking
         4. **View results** frame-by-frame with skeleton overlay
-        5. **Add manual tracking points** by clicking on the video
+        5. **Toggle "Point Mode"** to click on the video and add tracking points
         6. **Export** the replay video or CSV data
 
         ---
@@ -624,56 +639,103 @@ def main():
     if T == 0:
         return
 
+    # -- Replay video generation (runs first when button clicked) --
+    if getattr(ss, "_do_replay", False):
+        ss._do_replay = False
+        with st.spinner("Generating replay video..."):
+            video_data = generate_replay_video(
+                ss.frames_bgr, ss.poses, ss.ball_positions,
+                ss.manual_tracks, ss.fps, mm_per_pixel,
+            )
+        if video_data:
+            ss._replay_data = video_data
+            st.success("Replay video ready!")
+        else:
+            st.error("Failed to generate video.")
+
+    # Show cached replay video
+    if getattr(ss, "_replay_data", None):
+        st.markdown("### Replay Video")
+        st.video(ss._replay_data)
+        st.download_button(
+            "⬇ Download Replay Video",
+            ss._replay_data,
+            file_name="mocap_replay.mp4",
+            mime="video/mp4",
+        )
+        if st.button("✕ Close Replay", key="close_replay"):
+            ss._replay_data = None
+            st.rerun()
+        st.divider()
+
     st.markdown("### Frame Viewer")
 
-    # Playback controls
-    c_slider, c_play, c_pause, c_speed = st.columns([3, 0.7, 0.7, 1])
-    with c_slider:
-        frame_slider = st.slider(
-            "Frame", 0, T - 1, ss.current_frame, 1,
-            key="frame_nav", label_visibility="collapsed",
+    # Point mode toggle + color legend
+    col_pt, col_leg = st.columns([1, 3])
+    with col_pt:
+        point_mode = st.checkbox(
+            "🎯 Point Mode",
+            value=getattr(ss, "point_mode", False),
+            key="point_mode_cb",
+            help="Toggle ON then click on the frame to add tracking points",
         )
-        ss.current_frame = frame_slider
+        ss.point_mode = point_mode
+    with col_leg:
+        if point_mode:
+            st.info("Click on the image to add a point — it will be auto-tracked (🟢 ball, 🔵 manual)")
+        else:
+            st.caption("Toggle Point Mode to add tracking markers")
+
+    # Playback controls
+    c_slider, c_play, c_speed = st.columns([4, 0.8, 1])
+    with c_slider:
+        # Use session_state directly to avoid slider/session conflict
+        if "frame_idx" not in ss:
+            ss.frame_idx = ss.current_frame
+        ss.frame_idx = st.slider(
+            "Frame", 0, T - 1, ss.frame_idx, 1,
+            key="frame_slider",
+        )
     with c_speed:
         play_fps = st.number_input(
             "FPS", 1, 60, getattr(ss, "play_fps", 10), 1,
-            key="play_fps_input",
+            key="play_fps_inp",
         )
         ss.play_fps = play_fps
     with c_play:
-        if st.button("▶", key="btn_play", help="Play", use_container_width=True):
-            ss.play_mode = True
-    with c_pause:
-        if st.button("⏸", key="btn_pause", help="Pause", use_container_width=True):
-            ss.play_mode = False
+        is_playing = getattr(ss, "play_mode", False)
+        if st.button("⏸" if is_playing else "▶", key="btn_playpause", help="Play/Pause", use_container_width=True):
+            ss.play_mode = not is_playing
+            if ss.play_mode:
+                ss.frame_idx = ss.frame_idx  # start from current frame
 
-    # Auto-advance when playing
+    # Auto-advance loop
     if getattr(ss, "play_mode", False):
-        if ss.current_frame < T - 1:
-            ss.current_frame += 1
-            import time as _time
-            _time.sleep(1.0 / max(ss.play_fps, 1))
+        if ss.frame_idx < T - 1:
+            ss.frame_idx += 1
+            time.sleep(1.0 / max(ss.play_fps, 1))
             st.rerun()
         else:
             ss.play_mode = False
             st.rerun()
 
-    frame_bgr = ss.frames_bgr[frame_slider]
-    landmarks = ss.poses[frame_slider] if frame_slider < len(ss.poses) else None
-    ball_pos = ss.ball_positions[frame_slider] if frame_slider < len(ss.ball_positions) else None
-    vel, dist, elapsed = calc_ball_metrics(ss.ball_positions, frame_slider, ss.fps, mm_per_pixel)
+    frame_idx = ss.frame_idx
+    ss.current_frame = frame_idx
+
+    frame_bgr = ss.frames_bgr[frame_idx]
+    landmarks = ss.poses[frame_idx] if frame_idx < len(ss.poses) else None
+    ball_pos = ss.ball_positions[frame_idx] if frame_idx < len(ss.ball_positions) else None
+    vel, dist, elapsed = calc_ball_metrics(ss.ball_positions, frame_idx, ss.fps, mm_per_pixel)
 
     manual_pos: Dict[int, Tuple[float, float]] = {}
     for pid, history in ss.manual_tracks.items():
         for f_idx, x, y in history:
-            if f_idx == frame_slider:
+            if f_idx == frame_idx:
                 manual_pos[pid] = (x, y)
                 break
 
-    traj_up_to = build_manual_trajectories_up_to(ss.manual_tracks, frame_slider)
-
-    # Build ball trajectory up to current frame
-    ball_traj = [(p[0], p[1]) for p in ss.ball_positions[:frame_slider + 1] if p is not None]
+    traj_up_to = build_manual_trajectories_up_to(ss.manual_tracks, frame_idx)
+    ball_traj = [(p[0], p[1]) for p in ss.ball_positions[:frame_idx + 1] if p is not None]
 
     overlaid = render_overlay_frame(
         frame_bgr, landmarks, ball_pos, manual_pos, traj_up_to,
@@ -684,21 +746,25 @@ def main():
     col_img, col_info = st.columns([3, 1])
 
     with col_img:
-        click_result = clickable_image(overlaid, f"f{frame_slider}")
-        if click_result and isinstance(click_result, dict) and "x" in click_result:
-            px, py = int(click_result["x"]), int(click_result["y"])
-            pid = ss.next_manual_id
-            ss.next_manual_id += 1
-            initial = {pid: (float(px), float(py))}
-            tracks = run_optical_flow_tracking(
-                ss.frames_gray, frame_slider, initial,
-            )
-            ss.manual_tracks[pid] = tracks[pid]
-            st.toast(f"Point #{pid} added and tracked!", icon="✅")
-            st.rerun()
+        if getattr(ss, "point_mode", False):
+            click_result = clickable_image(overlaid, f"f{frame_idx}")
+            if click_result and isinstance(click_result, dict) and "x" in click_result:
+                px, py = int(click_result["x"]), int(click_result["y"])
+                pid = ss.next_manual_id
+                ss.next_manual_id += 1
+                initial = {pid: (float(px), float(py))}
+                tracks = run_optical_flow_tracking(
+                    ss.frames_gray, frame_idx, initial,
+                )
+                ss.manual_tracks[pid] = tracks[pid]
+                st.toast(f"Point #{pid} added and tracked!", icon="✅")
+                st.rerun()
+        else:
+            rgb = cv2.cvtColor(overlaid, cv2.COLOR_BGR2RGB)
+            st.image(rgb, use_container_width=True)
 
     with col_info:
-        st.metric("Frame", f"{frame_slider} / {T - 1}")
+        st.metric("Frame", f"{frame_idx} / {T - 1}")
         st.metric("Time", f"{elapsed:.2f} s")
         st.metric("Velocity", f"{vel:.2f} mm/s")
         st.metric("Distance", f"{dist:.2f} mm")
@@ -706,7 +772,6 @@ def main():
         if landmarks is not None:
             detected_kps = sum(1 for lm in landmarks if lm[2] >= 0.3)
             st.caption(f"Keypoints detected: {detected_kps}/33")
-
         if ball_pos is not None:
             st.caption(f"Ball: ({ball_pos[0]:.0f}, {ball_pos[1]:.0f})")
 
@@ -725,29 +790,12 @@ def main():
                         st.rerun()
 
     st.divider()
-    st.caption(
-        "Click on the frame to add manual tracking points. "
-        "Points are automatically tracked using Lucas-Kanade optical flow."
-    )
+    if getattr(ss, "point_mode", False):
+        st.info("Point Mode ON — click on the image above to add tracking points")
+    else:
+        st.caption("Enable Point Mode above to add tracking markers")
 
-    if export_video_btn:
-        with st.spinner("Generating replay video..."):
-            video_data = generate_replay_video(
-                ss.frames_bgr, ss.poses, ss.ball_positions,
-                ss.manual_tracks, ss.fps, mm_per_pixel,
-            )
-        if video_data:
-            st.success("Replay video ready!")
-            st.video(video_data)
-            st.download_button(
-                "⬇ Download Replay Video",
-                video_data,
-                file_name="mocap_replay.mp4",
-                mime="video/mp4",
-            )
-        else:
-            st.error("Failed to generate video.")
-
+    # -- Export CSV --
     if export_csv_btn:
         import csv as csv_mod
         buf = io.StringIO()
@@ -767,7 +815,6 @@ def main():
                     if f_idx == fi:
                         writer.writerow([fi, f"{t:.4f}", "manual", pid, f"manual_{pid}", f"{mx:.2f}", f"{my:.2f}"])
                         break
-
         st.download_button(
             "⬇ Download CSV Data",
             buf.getvalue(),
