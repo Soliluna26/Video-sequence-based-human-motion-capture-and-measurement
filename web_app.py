@@ -168,37 +168,47 @@ def _gthread_try_http() -> bool:
 
 
 def _gthread_unpack_deb(deb_path: str) -> bool:
-    """Unpack a .deb and extract libgthread-2.0.so.0."""
+    """Unpack a .deb and extract libgthread + libglib to the cache dir.
+
+    Both come from the SAME Bullseye .deb so they are ABI-compatible.
+    """
+    # Libraries we need from the .deb (SONAME → destination path)
+    _LIBS = {
+        _GTHREAD_SO: _GTHREAD_SO_PATH,
+        "libglib-2.0.so.0": _GTHREAD_DIR + "/libglib-2.0.so.0",
+    }
+
     data_tar = _gthread_extract_data_tar(deb_path)
     if data_tar is None:
         _gthread_log("Failed to extract data.tar from .deb (bad ar format?)")
         return False
     _gthread_log(f"Extracted data tarball: {os.path.getsize(data_tar)} bytes")
     try:
-        # Extract .so from data tarball
         extract_dir = tempfile.mkdtemp(dir=_GTHREAD_DIR)
         try:
             with tarfile.open(data_tar, "r:*") as tf:
                 tf.extractall(extract_dir, filter="data")
-            found = False
+            _found = set()
             for root, _dirs, files in os.walk(extract_dir):
                 for fn in files:
-                    if fn == _GTHREAD_SO or fn.startswith(_GTHREAD_SO + "."):
-                        fp = os.path.join(root, fn)
-                        if os.path.islink(fp) or os.path.getsize(fp) < 1024:
+                    for _soname, _dest in _LIBS.items():
+                        if _soname in _found:
                             continue
-                        with open(fp, "rb") as fh:
-                            if fh.read(4) != b"\x7fELF":
+                        if fn == _soname or fn.startswith(_soname + "."):
+                            fp = os.path.join(root, fn)
+                            if os.path.islink(fp) or os.path.getsize(fp) < 1024:
                                 continue
-                        shutil.copy2(fp, _GTHREAD_SO_PATH)
-                        os.chmod(_GTHREAD_SO_PATH, 0o755)
-                        _gthread_log(
-                            f"Copied {_GTHREAD_SO} "
-                            f"({os.path.getsize(_GTHREAD_SO_PATH)} bytes)"
-                        )
-                        found = True
-                        break
-                if found:
+                            with open(fp, "rb") as fh:
+                                if fh.read(4) != b"\x7fELF":
+                                    continue
+                            shutil.copy2(fp, _dest)
+                            os.chmod(_dest, 0o755)
+                            _gthread_log(
+                                f"Copied {_soname} ({os.path.getsize(_dest)} bytes)"
+                            )
+                            _found.add(_soname)
+                            break
+                if len(_found) == len(_LIBS):
                     break
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
@@ -210,8 +220,9 @@ def _gthread_unpack_deb(deb_path: str) -> bool:
                 except OSError:
                     pass
 
-    if not os.path.exists(_GTHREAD_SO_PATH):
-        _gthread_log("libgthread-2.0.so.0 NOT found in .deb data tarball")
+    if len(_found) != len(_LIBS):
+        _missing = [k for k in _LIBS if k not in _found]
+        _gthread_log(f"NOT found in .deb: {_missing}")
         return False
 
     # Mark success for subsequent runs
@@ -249,56 +260,20 @@ def _gthread_extract_data_tar(deb_path: str) -> str | None:
 
 
 def _gthread_set_ld_path():
-    """Prepend cache dir to LD_LIBRARY_PATH; symlink system libglib; preload."""
-    import ctypes.util as _ctu
+    """Prepend cache dir to LD_LIBRARY_PATH.
 
+    Both libgthread-2.0.so.0 and libglib-2.0.so.0 from Bullseye
+    live in this directory, so the dynamic linker resolves everything
+    by itself — no ctypes preload needed.
+    """
     cur = os.environ.get("LD_LIBRARY_PATH", "")
     if _GTHREAD_DIR not in cur.split(os.pathsep):
         os.environ["LD_LIBRARY_PATH"] = (
             _GTHREAD_DIR + os.pathsep + cur if cur else _GTHREAD_DIR
         )
-    _gthread_log(f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '(empty)')}")
-
-    # The Bullseye libgthread-2.0.so.0 depends on libglib-2.0.so.0.
-    # Find the system's libglib and symlink it alongside our libgthread
-    # so the dynamic linker can resolve the dependency.
-    _glib_link = _GTHREAD_DIR + "/libglib-2.0.so.0"
-    if not os.path.exists(_glib_link):
-        _sys_glib = _ctu.find_library("glib-2.0")
-        if _sys_glib:
-            os.symlink(_sys_glib, _glib_link)
-            _gthread_log(f"Symlinked {_glib_link} -> {_sys_glib}")
-        else:
-            # Try common paths directly
-            for _p in (
-                "/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0",
-                "/lib/x86_64-linux-gnu/libglib-2.0.so.0",
-                "/usr/lib/libglib-2.0.so.0",
-            ):
-                if os.path.exists(_p):
-                    os.symlink(_p, _glib_link)
-                    _gthread_log(f"Symlinked {_glib_link} -> {_p}")
-                    break
-
-    # Preload with ctypes to register the library in the dynamic linker's
-    # namespace BEFORE cv2's .so is dlopen'd.  This satisfies the NEEDED
-    # dependency on libgthread-2.0.so.0 by SONAME.
-    # RTLD constants live in different modules across Python versions;
-    # the POSIX values are stable: RTLD_NOW=2, RTLD_GLOBAL=256.
-    if os.path.exists(_GTHREAD_SO_PATH):
-        try:
-            import ctypes as _ct
-            _RTLD_GLOBAL = getattr(os, "RTLD_GLOBAL", None) \
-                or getattr(_ct, "RTLD_GLOBAL", None) or 256
-            _RTLD_NOW = getattr(os, "RTLD_NOW", None) \
-                or getattr(_ct, "RTLD_NOW", None) or 2
-            _ct.CDLL(
-                _GTHREAD_SO_PATH,
-                mode=_RTLD_GLOBAL | _RTLD_NOW,
-            )
-            _gthread_log("Preloaded libgthread-2.0.so.0 into process")
-        except Exception as _e:
-            _gthread_log(f"ctypes preload failed: {_e}")
+    _gthread_log(
+        f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '(empty)')}"
+    )
 
 
 if not _gthread_setup():
