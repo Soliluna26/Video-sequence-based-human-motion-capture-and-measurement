@@ -260,16 +260,22 @@ def _gthread_set_ld_path():
     # Preload with ctypes to register the library in the dynamic linker's
     # namespace BEFORE cv2's .so is dlopen'd.  This satisfies the NEEDED
     # dependency on libgthread-2.0.so.0 by SONAME.
+    # RTLD constants live in different modules across Python versions;
+    # the POSIX values are stable: RTLD_NOW=2, RTLD_GLOBAL=256.
     if os.path.exists(_GTHREAD_SO_PATH):
         try:
             import ctypes as _ct
+            _RTLD_GLOBAL = getattr(os, "RTLD_GLOBAL", None) \
+                or getattr(_ct, "RTLD_GLOBAL", None) or 256
+            _RTLD_NOW = getattr(os, "RTLD_NOW", None) \
+                or getattr(_ct, "RTLD_NOW", None) or 2
             _ct.CDLL(
                 _GTHREAD_SO_PATH,
-                mode=os.RTLD_GLOBAL | os.RTLD_NOW,
+                mode=_RTLD_GLOBAL | _RTLD_NOW,
             )
             _gthread_log("Preloaded libgthread-2.0.so.0 into process")
         except Exception as _e:
-            _gthread_log(f"ctypes preload failed (will rely on LD_LIBRARY_PATH): {_e}")
+            _gthread_log(f"ctypes preload failed: {_e}")
 
 
 if not _gthread_setup():
