@@ -4,300 +4,19 @@
 Launch locally:
     streamlit run web_app.py
 
-Or deploy to Streamlit Community Cloud for zero-download browser access.
-Reuses all existing src/ modules without modification.
+Deploy to HuggingFace Spaces (Docker SDK):
+    Uses python:3.11-slim-bullseye (Debian 11, GLib 2.66) which provides
+    libgthread-2.0.so.0 natively — no runtime hacks needed.
 """
 
 import base64
 import io
 import os
-import shutil
-import sys
-import tarfile
 import tempfile
 import time
-import urllib.request as _request
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-# -- Provide libgthread-2.0.so.0 on Debian Trixie (GLib >= 2.72) --
-# opencv-contrib-python (pulled by mediapipe) links libgthread-2.0.so.0
-# which was removed upstream.  Streamlit Cloud runs Debian Trixie where
-# it does not exist.  We first try to download libglib2.0-0 from the
-# bullseye repo via apt, then fall back to Debian archive HTTP mirrors.
-# Bullseye's GLib 2.66 libgthread depends on libglib-2.0.so.0 (same SONAME
-# as Trixie's GLib 2.82 — backward ABI-compatible).
-import subprocess as _sp  # noqa: E402
-
-# Avoid /tmp — it may be mounted noexec on container platforms
-_GTHREAD_DIR = os.path.join(
-    os.path.expanduser("~"), ".mocap_lib"
-) if sys.platform == "linux" else os.path.join(tempfile.gettempdir(), "mocap_lib")
-_GTHREAD_FLAG = _GTHREAD_DIR + "/.extracted"
-_GTHREAD_SO = "libgthread-2.0.so.0"
-_GTHREAD_SO_PATH = _GTHREAD_DIR + "/" + _GTHREAD_SO
-
-
-def _gthread_log(msg: str):
-    print(f"[mocap] {msg}", file=sys.stderr, flush=True)
-
-
-def _gthread_setup() -> bool:
-    """Download and cache libgthread-2.0.so.0; add to LD_LIBRARY_PATH."""
-    if sys.platform != "linux":
-        return False
-
-    # Already done in this deployment?
-    if os.path.exists(_GTHREAD_FLAG) and os.path.exists(_GTHREAD_SO_PATH):
-        _gthread_set_ld_path()
-        _gthread_log("libgthread-2.0.so.0 already cached, LD_LIBRARY_PATH set")
-        return True
-
-    os.makedirs(_GTHREAD_DIR, exist_ok=True)
-
-    # --- Strategy 1: apt-get download from Debian Bullseye ---
-    if _gthread_try_apt():
-        _gthread_set_ld_path()
-        return True
-
-    # --- Strategy 2: download .deb via HTTP from archive.debian.org ---
-    if _gthread_try_http():
-        _gthread_set_ld_path()
-        return True
-
-    _gthread_log("All strategies failed — cv2 import will likely crash")
-    return False
-
-
-def _gthread_try_apt() -> bool:
-    """Use apt-get -o to download libglib2.0-0 from bullseye into /tmp."""
-    deb_path = _GTHREAD_DIR + "/._apt_libglib.deb"
-    src_list = _GTHREAD_DIR + "/bullseye.list"
-    apt_lists = _GTHREAD_DIR + "/apt-lists"
-    apt_cache = _GTHREAD_DIR + "/apt-cache"
-
-    try:
-        # Write a custom sources.list in /tmp (writable)
-        with open(src_list, "w") as f:
-            f.write("deb http://archive.debian.org/debian bullseye main\n")
-
-        os.makedirs(apt_lists + "/partial", exist_ok=True)
-        os.makedirs(apt_cache, exist_ok=True)
-
-        _apt_opts = [
-            "-o", f"Dir::Etc::sourcelist={src_list}",
-            "-o", "Dir::Etc::sourceparts=-",  # disable default sources
-            "-o", f"Dir::State::lists={apt_lists}",
-            "-o", f"Dir::Cache={apt_cache}",
-            "-o", "APT::Get::AllowUnauthenticated=true",
-            "-o", "Acquire::AllowInsecureRepositories=true",
-            "-o", "Acquire::AllowDowngradeToInsecureRepositories=true",
-        ]
-
-        _sp.run(
-            ["apt-get"] + _apt_opts + ["update", "-qq"],
-            capture_output=True, timeout=120,
-        )
-
-        # Find the available version
-        madison = _sp.run(
-            ["apt-cache"] + _apt_opts + ["madison", "libglib2.0-0"],
-            capture_output=True, text=True, timeout=30,
-        )
-        _gthread_log(f"Available versions: {madison.stdout.strip()}")
-
-        result = _sp.run(
-            ["apt-get"] + _apt_opts + ["download", "-qq", "libglib2.0-0"],
-            capture_output=True, timeout=120, cwd=_GTHREAD_DIR,
-        )
-        if result.returncode != 0:
-            err = result.stderr.decode(errors="replace")[:300]
-            _gthread_log(f"apt-get download failed: {err}")
-            return False
-
-        # Find the downloaded .deb (version is dynamic)
-        for fn in os.listdir(_GTHREAD_DIR):
-            if fn.startswith("libglib2.0-0_") and fn.endswith("_amd64.deb"):
-                src = os.path.join(_GTHREAD_DIR, fn)
-                os.rename(src, deb_path)
-                _gthread_log(f"Downloaded via apt: {fn} ({os.path.getsize(deb_path)} bytes)")
-                return _gthread_unpack_deb(deb_path)
-
-        _gthread_log("apt-get ran but no .deb found in output dir")
-        return False
-    except Exception as e:
-        _gthread_log(f"apt strategy exception: {e}")
-        return False
-    finally:
-        for p in (deb_path, src_list):
-            if os.path.exists(p):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-        shutil.rmtree(apt_lists, ignore_errors=True)
-        shutil.rmtree(apt_cache, ignore_errors=True)
-
-
-def _gthread_try_http() -> bool:
-    """Fallback: download .deb via HTTP from Debian snapshot/archive."""
-    deb_path = _GTHREAD_DIR + "/._http_libglib.deb"
-    # snapshot.debian.org has every version; archive.debian.org has the final one
-    _URLS = [
-        # First try: snapshot with a known bullseye version (2.66.8-1+deb11u1)
-        "https://snapshot.debian.org/archive/debian/20230320T024800Z"
-        "/pool/main/g/glib2.0/libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
-        # Second try: archive.debian.org (Debian archive)
-        "http://archive.debian.org/debian/pool/main/g/glib2.0/"
-        "libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
-        "http://archive.debian.org/debian/pool/main/g/glib2.0/"
-        "libglib2.0-0_2.66.8-1_amd64.deb",
-        # Third try: generic snapshot (try to list directory)
-        "https://snapshot.debian.org/archive/debian/20230101T000000Z"
-        "/pool/main/g/glib2.0/libglib2.0-0_2.66.8-1_amd64.deb",
-    ]
-    for url in _URLS:
-        _gthread_log(f"Trying {url} ...")
-        try:
-            _request.urlretrieve(url, deb_path)
-            sz = os.path.getsize(deb_path)
-            if sz > 500_000:
-                return _gthread_unpack_deb(deb_path)
-            _gthread_log(f"Too small ({sz} bytes), likely an error page")
-        except Exception as e:
-            _gthread_log(f"HTTP error: {e}")
-    return False
-
-
-def _gthread_unpack_deb(deb_path: str) -> bool:
-    """Unpack a .deb and extract libgthread + libglib to the cache dir.
-
-    Both come from the SAME Bullseye .deb so they are ABI-compatible.
-    """
-    # Libraries we need from the .deb (SONAME → destination path)
-    _LIBS = {
-        _GTHREAD_SO: _GTHREAD_SO_PATH,
-        "libglib-2.0.so.0": _GTHREAD_DIR + "/libglib-2.0.so.0",
-    }
-
-    data_tar = _gthread_extract_data_tar(deb_path)
-    if data_tar is None:
-        _gthread_log("Failed to extract data.tar from .deb (bad ar format?)")
-        return False
-    _gthread_log(f"Extracted data tarball: {os.path.getsize(data_tar)} bytes")
-    try:
-        extract_dir = tempfile.mkdtemp(dir=_GTHREAD_DIR)
-        try:
-            with tarfile.open(data_tar, "r:*") as tf:
-                tf.extractall(extract_dir, filter="data")
-            _found = set()
-            for root, _dirs, files in os.walk(extract_dir):
-                for fn in files:
-                    for _soname, _dest in _LIBS.items():
-                        if _soname in _found:
-                            continue
-                        if fn == _soname or fn.startswith(_soname + "."):
-                            fp = os.path.join(root, fn)
-                            if os.path.islink(fp) or os.path.getsize(fp) < 1024:
-                                continue
-                            with open(fp, "rb") as fh:
-                                if fh.read(4) != b"\x7fELF":
-                                    continue
-                            shutil.copy2(fp, _dest)
-                            os.chmod(_dest, 0o755)
-                            _gthread_log(
-                                f"Copied {_soname} ({os.path.getsize(_dest)} bytes)"
-                            )
-                            _found.add(_soname)
-                            break
-                if len(_found) == len(_LIBS):
-                    break
-        finally:
-            shutil.rmtree(extract_dir, ignore_errors=True)
-    finally:
-        for p in (deb_path, data_tar if data_tar and os.path.exists(data_tar) else None):
-            if p and os.path.exists(p):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-
-    if len(_found) != len(_LIBS):
-        _missing = [k for k in _LIBS if k not in _found]
-        _gthread_log(f"NOT found in .deb: {_missing}")
-        return False
-
-    # Mark success for subsequent runs
-    with open(_GTHREAD_FLAG, "w") as f:
-        f.write("1\n")
-    return True
-
-
-def _gthread_extract_data_tar(deb_path: str) -> str | None:
-    """Parse a .deb (ar archive) and extract the data.tar.* member."""
-    with open(deb_path, "rb") as f:
-        if f.read(8) != b"!<arch>\n":
-            _gthread_log("Not a valid ar archive (missing !<arch> magic)")
-            return None
-        while True:
-            header = f.read(60)
-            if len(header) < 60:
-                break
-            name = header[0:16].rstrip(b" ").decode("ascii", errors="replace")
-            name = name.rstrip("/")
-            size_str = header[48:58].rstrip(b" ").decode("ascii", errors="replace")
-            try:
-                size = int(size_str)
-            except ValueError:
-                return None
-            data = f.read(size)
-            if size % 2 != 0:
-                f.read(1)  # ar padding byte
-            if name.startswith("data.tar"):
-                out = _GTHREAD_DIR + "/_data.tar"
-                with open(out, "wb") as wf:
-                    wf.write(data)
-                return out
-    return None
-
-
-def _gthread_set_ld_path():
-    """Preload both Bullseye .so files via absolute-path ctypes.CDLL.
-
-    Streamlit Cloud's runtime ignores LD_LIBRARY_PATH and dlopen
-    dependency search, so we load libglib first (full path), then
-    libgthread (full path).  Both are registered in the dynamic
-    linker's namespace by SONAME before cv2 is imported.
-    """
-    import ctypes as _ct
-    _RTLD_GLOBAL = getattr(os, "RTLD_GLOBAL", None) \
-        or getattr(_ct, "RTLD_GLOBAL", None) or 256
-    _RTLD_NOW = getattr(os, "RTLD_NOW", None) \
-        or getattr(_ct, "RTLD_NOW", None) or 2
-    _mode = _RTLD_GLOBAL | _RTLD_NOW
-
-    # 1) Load libglib first — libgthread depends on it
-    _glib_path = _GTHREAD_DIR + "/libglib-2.0.so.0"
-    if os.path.exists(_glib_path):
-        try:
-            _ct.CDLL(_glib_path, mode=_mode)
-            _gthread_log("Preloaded libglib-2.0.so.0")
-        except Exception as _e:
-            _gthread_log(f"libglib preload failed: {_e}")
-            return
-
-    # 2) Load libgthread — dependency already satisfied
-    if os.path.exists(_GTHREAD_SO_PATH):
-        try:
-            _ct.CDLL(_GTHREAD_SO_PATH, mode=_mode)
-            _gthread_log("Preloaded libgthread-2.0.so.0")
-        except Exception as _e:
-            _gthread_log(f"libgthread preload failed: {_e}")
-
-
-if not _gthread_setup():
-    _gthread_log("WARNING: libgthread-2.0.so.0 not available")
 
 import cv2
 import numpy as np
@@ -634,9 +353,9 @@ def init_session_state():
         "ball_positions": [],
         "processing_done": False,
         "current_frame": 0,
-        "manual_tracks": {},      # pid -> [(frame_idx, x, y), ...]
+        "manual_tracks": {},
         "next_manual_id": 0,
-        "pending_manual_points": {},  # pid -> (frame_idx, x, y) — added but not tracked yet
+        "pending_manual_points": {},
         "processing_error": None,
     }
     for key, val in defaults.items():
@@ -648,11 +367,7 @@ def init_session_state():
 # Clickable image component
 # ---------------------------------------------------------------------------
 def clickable_image(frame_bgr: np.ndarray, key: str) -> Optional[Dict]:
-    """Display a clickable BGR frame. Returns {'x': int, 'y': int} on click.
-
-    Uses an HTML component that captures click events and maps them to
-    original frame coordinates.
-    """
+    """Display a clickable BGR frame. Returns {'x': int, 'y': int} on click."""
     h, w = frame_bgr.shape[:2]
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(rgb)
@@ -727,7 +442,6 @@ def main():
             key="video_uploader",
         )
         if uploaded is not None:
-            # Check if it's a new file
             if ss.video_name != uploaded.name:
                 ss.video_name = uploaded.name
                 ss.processing_done = False
@@ -739,12 +453,10 @@ def main():
                 ss.next_manual_id = 0
                 ss.pending_manual_points = {}
                 ss.current_frame = 0
-                # Save to temp file
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix)
                 tmp.write(uploaded.read())
                 tmp.close()
                 ss.video_path = tmp.name
-                # Probe video
                 cap = cv2.VideoCapture(ss.video_path)
                 if cap.isOpened():
                     ss.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -795,7 +507,6 @@ def main():
 
         st.divider()
         st.caption("Powered by MediaPipe + OpenCV")
-        st.caption("Streamlit Community Cloud ready")
 
     # -- Processing --
     if do_process and ss.video_path:
@@ -805,7 +516,6 @@ def main():
             frames = loader.load_frames()
             T = len(frames)
 
-            # Store BGR frames individually for random access
             ss.frames_bgr = [frames[i] for i in range(T)]
             ss.frames_gray = [
                 cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY) for i in range(T)
@@ -815,7 +525,6 @@ def main():
         progress_bar = st.progress(0.0)
         status_text = st.empty()
 
-        # Pose estimation
         status_text.text("Running pose estimation...")
         estimator = get_pose_estimator()
         ss.poses = []
@@ -824,7 +533,6 @@ def main():
             ss.poses.append(pose)
             progress_bar.progress((i + 1) / (T * 2))
 
-        # Ball tracking
         status_text.text("Running ball tracking...")
         ball_tracker = BallTracker()
         ss.ball_positions = []
@@ -846,12 +554,10 @@ def main():
         st.success(f"Done! Processed {T} frames. Navigate frames below.")
         st.rerun()
 
-    # -- Error display --
     if ss.processing_error:
         st.error(ss.processing_error)
         ss.processing_error = None
 
-    # -- Main content area --
     if not ss.processing_done:
         st.markdown("""
         ## Welcome to Human Motion Capture & Measurement
@@ -871,7 +577,6 @@ def main():
         """)
         return
 
-    # -- Results view --
     T = ss.frame_count
     if T == 0:
         return
@@ -883,13 +588,11 @@ def main():
     )
     ss.current_frame = frame_slider
 
-    # Build frame display
     frame_bgr = ss.frames_bgr[frame_slider]
     landmarks = ss.poses[frame_slider] if frame_slider < len(ss.poses) else None
     ball_pos = ss.ball_positions[frame_slider] if frame_slider < len(ss.ball_positions) else None
     vel, dist, elapsed = calc_ball_metrics(ss.ball_positions, frame_slider, ss.fps, mm_per_pixel)
 
-    # Get manual positions at this frame
     manual_pos: Dict[int, Tuple[float, float]] = {}
     for pid, history in ss.manual_tracks.items():
         for f_idx, x, y in history:
@@ -904,7 +607,6 @@ def main():
         vel, dist, elapsed,
     )
 
-    # Display clickable image
     col_img, col_info = st.columns([3, 1])
 
     with col_img:
@@ -913,7 +615,6 @@ def main():
             px, py = int(click_result["x"]), int(click_result["y"])
             pid = ss.next_manual_id
             ss.next_manual_id += 1
-            # Run optical flow tracking from this frame
             initial = {pid: (float(px), float(py))}
             tracks = run_optical_flow_tracking(
                 ss.frames_gray, frame_slider, initial,
@@ -935,13 +636,11 @@ def main():
         if ball_pos is not None:
             st.caption(f"Ball: ({ball_pos[0]:.0f}, {ball_pos[1]:.0f})")
 
-        # Manual points list
         if ss.manual_tracks:
             st.divider()
             st.markdown("**Manual Points**")
             for pid in sorted(ss.manual_tracks.keys()):
                 history = ss.manual_tracks[pid]
-                last = history[-1] if history else None
                 tracked_frames = len(history)
                 col_pt, col_del = st.columns([3, 1])
                 with col_pt:
@@ -957,7 +656,6 @@ def main():
         "Points are automatically tracked using Lucas-Kanade optical flow."
     )
 
-    # -- Export handlers --
     if export_video_btn:
         with st.spinner("Generating replay video..."):
             video_data = generate_replay_video(

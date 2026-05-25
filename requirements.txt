@@ -1,8 +1,8 @@
 # Video-based Human Motion Capture and Measurement System
-# Core dependencies
 
 # Video / image processing
-opencv-contrib-python-headless>=4.8.0
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
 Pillow>=10.0.0
 imageio>=2.31.0
 
@@ -24,6 +24,3 @@ streamlit>=1.28.0
 
 # Data export
 PyYAML>=6.0
-
-# Optional: MATLAB file export
-scipy>=1.11.0
