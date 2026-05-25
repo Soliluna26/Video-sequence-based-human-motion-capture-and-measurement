@@ -263,7 +263,10 @@ def _gthread_set_ld_path():
     if os.path.exists(_GTHREAD_SO_PATH):
         try:
             import ctypes as _ct
-            _ct.CDLL(_GTHREAD_SO_PATH, mode=_ct.RTLD_GLOBAL | _ct.RTLD_NOW)
+            _ct.CDLL(
+                _GTHREAD_SO_PATH,
+                mode=os.RTLD_GLOBAL | os.RTLD_NOW,
+            )
             _gthread_log("Preloaded libgthread-2.0.so.0 into process")
         except Exception as _e:
             _gthread_log(f"ctypes preload failed (will rely on LD_LIBRARY_PATH): {_e}")
