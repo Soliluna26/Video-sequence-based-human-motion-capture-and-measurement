@@ -263,11 +263,13 @@ def _gthread_extract_data_tar(deb_path: str) -> str | None:
 
 
 def _gthread_set_ld_path():
-    """Prepend cache dir to LD_LIBRARY_PATH.
+    """Prepend cache dir to LD_LIBRARY_PATH, then preload via ctypes.
 
-    Both libgthread-2.0.so.0 and libglib-2.0.so.0 from Bullseye
-    live in this directory, so the dynamic linker resolves everything
-    by itself — no ctypes preload needed.
+    ctypes.CDLL with the full path triggers dlopen(), which registers
+    the SONAME in the dynamic linker's namespace.  Since both
+    libgthread-2.0.so.0 AND libglib-2.0.so.0 are in _GTHREAD_DIR,
+    and dlopen searches the loading library's own directory for
+    dependencies, libglib is found automatically.
     """
     cur = os.environ.get("LD_LIBRARY_PATH", "")
     if _GTHREAD_DIR not in cur.split(os.pathsep):
@@ -277,6 +279,19 @@ def _gthread_set_ld_path():
     _gthread_log(
         f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '(empty)')}"
     )
+
+    # Preload via dlopen — the linker searches the .so's own directory first
+    if os.path.exists(_GTHREAD_SO_PATH):
+        try:
+            import ctypes as _ct
+            _RTLD_GLOBAL = getattr(os, "RTLD_GLOBAL", None) \
+                or getattr(_ct, "RTLD_GLOBAL", None) or 256
+            _RTLD_NOW = getattr(os, "RTLD_NOW", None) \
+                or getattr(_ct, "RTLD_NOW", None) or 2
+            _ct.CDLL(_GTHREAD_SO_PATH, mode=_RTLD_GLOBAL | _RTLD_NOW)
+            _gthread_log("Preloaded into process")
+        except Exception as _e:
+            _gthread_log(f"Preload failed: {_e}")
 
 
 if not _gthread_setup():
