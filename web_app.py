@@ -263,35 +263,37 @@ def _gthread_extract_data_tar(deb_path: str) -> str | None:
 
 
 def _gthread_set_ld_path():
-    """Prepend cache dir to LD_LIBRARY_PATH, then preload via ctypes.
+    """Preload both Bullseye .so files via absolute-path ctypes.CDLL.
 
-    ctypes.CDLL with the full path triggers dlopen(), which registers
-    the SONAME in the dynamic linker's namespace.  Since both
-    libgthread-2.0.so.0 AND libglib-2.0.so.0 are in _GTHREAD_DIR,
-    and dlopen searches the loading library's own directory for
-    dependencies, libglib is found automatically.
+    Streamlit Cloud's runtime ignores LD_LIBRARY_PATH and dlopen
+    dependency search, so we load libglib first (full path), then
+    libgthread (full path).  Both are registered in the dynamic
+    linker's namespace by SONAME before cv2 is imported.
     """
-    cur = os.environ.get("LD_LIBRARY_PATH", "")
-    if _GTHREAD_DIR not in cur.split(os.pathsep):
-        os.environ["LD_LIBRARY_PATH"] = (
-            _GTHREAD_DIR + os.pathsep + cur if cur else _GTHREAD_DIR
-        )
-    _gthread_log(
-        f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '(empty)')}"
-    )
+    import ctypes as _ct
+    _RTLD_GLOBAL = getattr(os, "RTLD_GLOBAL", None) \
+        or getattr(_ct, "RTLD_GLOBAL", None) or 256
+    _RTLD_NOW = getattr(os, "RTLD_NOW", None) \
+        or getattr(_ct, "RTLD_NOW", None) or 2
+    _mode = _RTLD_GLOBAL | _RTLD_NOW
 
-    # Preload via dlopen — the linker searches the .so's own directory first
+    # 1) Load libglib first — libgthread depends on it
+    _glib_path = _GTHREAD_DIR + "/libglib-2.0.so.0"
+    if os.path.exists(_glib_path):
+        try:
+            _ct.CDLL(_glib_path, mode=_mode)
+            _gthread_log("Preloaded libglib-2.0.so.0")
+        except Exception as _e:
+            _gthread_log(f"libglib preload failed: {_e}")
+            return
+
+    # 2) Load libgthread — dependency already satisfied
     if os.path.exists(_GTHREAD_SO_PATH):
         try:
-            import ctypes as _ct
-            _RTLD_GLOBAL = getattr(os, "RTLD_GLOBAL", None) \
-                or getattr(_ct, "RTLD_GLOBAL", None) or 256
-            _RTLD_NOW = getattr(os, "RTLD_NOW", None) \
-                or getattr(_ct, "RTLD_NOW", None) or 2
-            _ct.CDLL(_GTHREAD_SO_PATH, mode=_RTLD_GLOBAL | _RTLD_NOW)
-            _gthread_log("Preloaded into process")
+            _ct.CDLL(_GTHREAD_SO_PATH, mode=_mode)
+            _gthread_log("Preloaded libgthread-2.0.so.0")
         except Exception as _e:
-            _gthread_log(f"Preload failed: {_e}")
+            _gthread_log(f"libgthread preload failed: {_e}")
 
 
 if not _gthread_setup():
