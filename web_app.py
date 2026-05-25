@@ -129,6 +129,7 @@ def render_overlay_frame(
 ) -> np.ndarray:
     """Render a frame with skeleton, ball, manual points, and trajectories."""
     canvas = frame_bgr.copy()
+    h, w = canvas.shape[:2]
 
     if landmarks is not None:
         canvas = draw_skeleton(canvas, landmarks, CYAN)
@@ -143,8 +144,6 @@ def render_overlay_frame(
             cv2.line(canvas, p1, p2, GREEN, 2)
 
     canvas = draw_trajectories(canvas, manual_trajectories, BLUE)
-
-    h, w = canvas.shape[:2]
     for pid, pos in manual_positions.items():
         px, py = int(np.clip(pos[0], 0, w - 1)), int(np.clip(pos[1], 0, h - 1))
         cv2.circle(canvas, (px, py), 6, BLUE, -1)
@@ -342,9 +341,24 @@ def generate_replay_video(
     if not frames_bgr:
         return b""
     h, w = frames_bgr[0].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    tmp_path = os.path.join(tempfile.gettempdir(), "mocap_replay.mp4")
-    writer = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
+    # Try browser-friendly WebM first, fall back to MP4
+    tmp_path = os.path.join(tempfile.gettempdir(), "mocap_replay.webm")
+    _codecs = [("VP80", ".webm"), ("avc1", ".mp4"), ("mp4v", ".mp4")]
+    writer = None
+    for _cc, _ext in _codecs:
+        tmp_path = os.path.join(tempfile.gettempdir(), f"mocap_replay{_ext}")
+        fourcc = cv2.VideoWriter_fourcc(*_cc)
+        w_test = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
+        if w_test.isOpened():
+            writer = w_test
+            break
+        else:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    if writer is None:
+        return b""
 
     # Accumulate ball trajectory frame by frame
     ball_traj: List[Tuple[float, float]] = []
@@ -580,61 +594,96 @@ def main():
         st.caption("Powered by MediaPipe + OpenCV")
 
     # ================================================================
-    # Processing mode
+    # Processing mode (chunked — End button works between chunks)
     # ================================================================
     if app_mode == "processing" and has_video:
-        with st.spinner("Loading frames..."):
-            loader = FrameLoader(ss.video_path, max_frames=max_frames)
-            ss.fps = loader.fps
-            frames = loader.load_frames()
-            T = len(frames)
-            ss.frames_bgr = [frames[i] for i in range(T)]
-            ss.frames_gray = [
-                cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY) for i in range(T)
-            ]
-            del frames
+        _proc_idx = _s("_proc_idx", 0)
+        _total_frames = _s("_total_frames", 0)
+        CHUNK = 30
+
+        # First chunk: load frames
+        if _proc_idx == 0:
+            with st.spinner("Loading frames..."):
+                loader = FrameLoader(ss.video_path, max_frames=max_frames)
+                ss.fps = loader.fps
+                frames = loader.load_frames()
+                _total_frames = len(frames)
+                ss._total_frames = _total_frames
+                ss.frames_bgr = [frames[i] for i in range(_total_frames)]
+                ss.frames_gray = [
+                    cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+                    for i in range(_total_frames)
+                ]
+                del frames
+            ss.poses = [None] * _total_frames
+            ss.ball_positions = [None] * _total_frames
 
         pb = st.progress(0.0)
-        sts = st.empty()
+        st.markdown(f"**Processing...**  ({_proc_idx}/{_total_frames} frames)")
+        if st.button("⏹ End", key="btn_end", help="Stop now and show partial results"):
+            # Release if estimator was cached
+            _est = getattr(ss, "_estimator", None)
+            if _est is not None:
+                _est.release()
+                ss._estimator = None
+            ss.frame_count = _proc_idx
+            ss.current_frame = 0
+            ss.frame_idx = 0
+            ss.play_mode = False
+            ss.app_mode = "done"
+            ss._do_replay = False
+            ss._replay_data = None
+            ss._proc_idx = 0
+            # Track pending points up to current frame
+            pending = _s("_pending_pts", [])
+            if pending and _proc_idx > 0:
+                for pid, px, py in pending:
+                    tracks = run_optical_flow_tracking(
+                        ss.frames_gray, 0, {pid: (px, py)},
+                    )
+                    ss.manual_tracks[pid] = tracks[pid]
+                    if pid >= ss.next_manual_id:
+                        ss.next_manual_id = pid + 1
+            ss._pending_pts = []
+            st.rerun()
 
-        sts.text("Running pose estimation...")
-        estimator = get_pose_estimator()
-        ss.poses = []
-        for i in range(T):
-            ss.poses.append(estimator.process_frame(ss.frames_bgr[i]))
-            pb.progress((i + 1) / (T * 2))
-
-        sts.text("Running ball tracking...")
+        # Process chunk
+        estimator = _s("_estimator", None)
+        if estimator is None:
+            estimator = get_pose_estimator()
+            ss._estimator = estimator
         bt = BallTracker()
-        ss.ball_positions = []
-        for i in range(T):
-            ss.ball_positions.append(bt.detect(ss.frames_bgr[i]))
-            pb.progress(0.5 + (i + 1) / (T * 2))
+        chunk_end = min(_proc_idx + CHUNK, _total_frames)
+        for i in range(_proc_idx, chunk_end):
+            ss.poses[i] = estimator.process_frame(ss.frames_bgr[i])
+            ss.ball_positions[i] = bt.detect(ss.frames_bgr[i])
+            pb.progress((i + 1) / _total_frames)
+        _proc_idx = chunk_end
+        ss._proc_idx = _proc_idx
 
-        estimator.release()
+        if _proc_idx >= _total_frames:
+            estimator.release()
+            ss._estimator = None
+            pending = _s("_pending_pts", [])
+            for pid, px, py in pending:
+                tracks = run_optical_flow_tracking(
+                    ss.frames_gray, 0, {pid: (px, py)},
+                )
+                ss.manual_tracks[pid] = tracks[pid]
+                if pid >= ss.next_manual_id:
+                    ss.next_manual_id = pid + 1
+            ss._pending_pts = []
+            ss.frame_count = _total_frames
+            ss.current_frame = 0
+            ss.frame_idx = 0
+            ss.play_mode = False
+            ss.app_mode = "done"
+            ss._do_replay = False
+            ss._replay_data = None
+            ss._proc_idx = 0
+            pb.empty()
+            st.success(f"Done! Processed {_total_frames} frames.")
 
-        # Track pending manual points from preview
-        pending = _s("_pending_pts", [])
-        for pid, px, py in pending:
-            tracks = run_optical_flow_tracking(
-                ss.frames_gray, 0, {pid: (px, py)},
-            )
-            ss.manual_tracks[pid] = tracks[pid]
-            if pid >= ss.next_manual_id:
-                ss.next_manual_id = pid + 1
-        ss._pending_pts = []
-
-        ss.frame_count = T
-        ss.current_frame = 0
-        ss.frame_idx = 0
-        ss.play_mode = False
-        ss.app_mode = "done"
-        ss._do_replay = False
-        ss._replay_data = None
-
-        pb.empty()
-        sts.empty()
-        st.success(f"Done! Processed {T} frames.")
         st.rerun()
 
     # ================================================================
@@ -708,19 +757,30 @@ def main():
                 ss.manual_tracks, ss.fps, mm_per_pixel,
             )
         if vdata:
-            # Write to temp file for st.video (more reliable than bytes)
+            ss._replay_data = vdata
+            # Write to a stable temp file for st.video playback
             _rp = os.path.join(tempfile.gettempdir(), "mocap_replay.mp4")
             with open(_rp, "wb") as f:
                 f.write(vdata)
             ss._replay_path = _rp
-            ss._replay_data = vdata
         else:
             st.error("Failed to generate video.")
 
     # --- Show replay video ---
     if getattr(ss, "_replay_path", None):
         st.markdown("### Replay Video")
-        st.video(ss._replay_path)
+        try:
+            st.video(ss._replay_path, format="video/mp4")
+        except Exception:
+            # Fallback: try raw HTML5 video
+            import base64 as _b64
+            _b64_data = _b64.b64encode(ss._replay_data).decode()
+            st.markdown(
+                f'<video controls width="100%">'
+                f'<source src="data:video/mp4;base64,{_b64_data}" type="video/mp4">'
+                f'</video>',
+                unsafe_allow_html=True,
+            )
         col_r1, col_r2 = st.columns([1, 1])
         with col_r1:
             st.download_button(
