@@ -30,7 +30,10 @@ from typing import Dict, List, Optional, Tuple
 # as Trixie's GLib 2.82 — backward ABI-compatible).
 import subprocess as _sp  # noqa: E402
 
-_GTHREAD_DIR = "/tmp/mocap_lib"
+# Avoid /tmp — it may be mounted noexec on container platforms
+_GTHREAD_DIR = os.path.join(
+    os.path.expanduser("~"), ".mocap_lib"
+) if sys.platform == "linux" else os.path.join(tempfile.gettempdir(), "mocap_lib")
 _GTHREAD_FLAG = _GTHREAD_DIR + "/.extracted"
 _GTHREAD_SO = "libgthread-2.0.so.0"
 _GTHREAD_SO_PATH = _GTHREAD_DIR + "/" + _GTHREAD_SO
