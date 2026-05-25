@@ -9,33 +9,154 @@ Reuses all existing src/ modules without modification.
 """
 
 import base64
-import importlib.metadata as _imd
 import io
 import os
+import shutil
 import sys
+import tarfile
 import tempfile
 import time
+import urllib.request as _request
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# -- Force cv2 to load headless native library --
-# mediapipe pulls opencv-contrib-python (non-headless) whose .so links
-# libgthread-2.0.so.0 (removed in GLib >= 2.72, not present on Debian Trixie).
-# opencv-contrib-python-headless is installed but cv2's bootstrap discovers
-# the non-headless variant first via importlib.metadata and loads its .so,
-# which crashes.  We monkey-patch distributions() to hide the non-headless
-# packages so the bootstrap only sees the headless one.
-_orig_distributions = _imd.distributions
+# -- Provide libgthread-2.0.so.0 on Debian Trixie (GLib >= 2.72) --
+# opencv-contrib-python (pulled by mediapipe) links libgthread-2.0.so.0
+# which was removed upstream.  Streamlit Cloud runs Debian Trixie where
+# it does not exist.  We download the real .so from Debian Bullseye's
+# libglib2.0-0 package at runtime and make it visible to the dynamic linker.
+# Bullseye's GLib 2.66 libgthread depends on libglib-2.0.so.0 (same SONAME
+# as Trixie's GLib 2.82 — backward-compatible ABI).
+_GTHREAD_DIR = "/tmp/mocap_lib"
+_GTHREAD_FLAG = _GTHREAD_DIR + "/.extracted"
+_GTHREAD_SO = "libgthread-2.0.so.0"
+_GTHREAD_SO_PATH = _GTHREAD_DIR + "/" + _GTHREAD_SO
 
-def _patched_distributions(**kwargs):
-    for dist in _orig_distributions(**kwargs):
-        name = dist.metadata.get("Name", "")
-        if name in ("opencv-contrib-python", "opencv-python"):
+
+def _gthread_setup() -> bool:
+    """Download and cache libgthread-2.0.so.0; add to LD_LIBRARY_PATH."""
+    if sys.platform != "linux":
+        return False
+
+    # Already done?
+    if os.path.exists(_GTHREAD_FLAG) and os.path.exists(_GTHREAD_SO_PATH):
+        _gthread_set_ld_path()
+        return True
+
+    # Mirror list for libglib2.0-0_2.66.8-1+deb11u1_amd64.deb (Debian Bullseye)
+    _MIRRORS = [
+        "http://archive.debian.org/debian/pool/main/g/glib2.0/"
+        "libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
+        "http://snapshot.debian.org/archive/debian/20230101T000000Z/"
+        "pool/main/g/glib2.0/libglib2.0-0_2.66.8-1_amd64.deb",
+        "http://ftp.debian.org/debian/pool/main/g/glib2.0/"
+        "libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
+    ]
+
+    os.makedirs(_GTHREAD_DIR, exist_ok=True)
+
+    deb_path = _GTHREAD_DIR + "/._tmp_libglib.deb"
+    for url in _MIRRORS:
+        try:
+            _request.urlretrieve(url, deb_path)
+            if os.path.getsize(deb_path) > 500_000:  # real .deb is ~1.5 MB
+                break
+        except Exception:
             continue
-        yield dist
+    else:
+        return False
 
-_imd.distributions = _patched_distributions
+    try:
+        # Parse ar archive to extract data.tar.* from the .deb
+        data_tar = _gthread_extract_data_tar(deb_path)
+        if data_tar is None:
+            return False
+
+        # Extract libgthread-2.0.so.0 from the data tarball
+        extract_dir = tempfile.mkdtemp(dir=_GTHREAD_DIR)
+        try:
+            with tarfile.open(data_tar, "r:*") as tf:
+                tf.extractall(extract_dir, filter="data")
+            # Walk extract_dir to find and copy the real .so (not symlink)
+            for root, _dirs, files in os.walk(extract_dir):
+                for fn in files:
+                    if fn == _GTHREAD_SO or fn.startswith(_GTHREAD_SO + "."):
+                        fp = os.path.join(root, fn)
+                        if os.path.islink(fp) or os.path.getsize(fp) < 1024:
+                            continue
+                        with open(fp, "rb") as fh:
+                            if fh.read(4) != b"\x7fELF":
+                                continue
+                        shutil.copy2(fp, _GTHREAD_SO_PATH)
+                        os.chmod(_GTHREAD_SO_PATH, 0o755)
+                        break
+                else:
+                    continue
+                break
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+    finally:
+        for p in (deb_path, data_tar if "data_tar" in dir() else None):
+            if p and os.path.exists(p):
+                os.unlink(p)
+
+    if not os.path.exists(_GTHREAD_SO_PATH):
+        return False
+
+    # Mark success
+    with open(_GTHREAD_FLAG, "w") as f:
+        f.write("1\n")
+
+    _gthread_set_ld_path()
+    return True
+
+
+def _gthread_extract_data_tar(deb_path: str) -> str | None:
+    """Parse a .deb (ar archive) and extract the data.tar.* member.
+
+    Returns path to the extracted data tarball, or None.
+    """
+    with open(deb_path, "rb") as f:
+        if f.read(8) != b"!<arch>\n":
+            return None
+        while True:
+            header = f.read(60)
+            if len(header) < 60:
+                break
+            name = header[0:16].rstrip(b" ").decode("ascii", errors="replace")
+            name = name.rstrip("/")
+            size_str = header[48:58].rstrip(b" ").decode("ascii", errors="replace")
+            try:
+                size = int(size_str)
+            except ValueError:
+                return None
+            data = f.read(size)
+            if size % 2 != 0:
+                f.read(1)  # ar padding
+            if name.startswith("data.tar"):
+                out = _GTHREAD_DIR + "/_data.tar"
+                with open(out, "wb") as wf:
+                    wf.write(data)
+                return out
+    return None
+
+
+def _gthread_set_ld_path():
+    """Prepend cache dir to LD_LIBRARY_PATH."""
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    if _GTHREAD_DIR not in cur.split(os.pathsep):
+        os.environ["LD_LIBRARY_PATH"] = (
+            _GTHREAD_DIR + os.pathsep + cur if cur else _GTHREAD_DIR
+        )
+
+
+if not _gthread_setup():
+    print(
+        "WARNING: Could not provide libgthread-2.0.so.0. "
+        "If cv2 import fails, the Debian mirror may be unreachable.",
+        file=sys.stderr,
+    )
 
 import cv2
 import numpy as np
