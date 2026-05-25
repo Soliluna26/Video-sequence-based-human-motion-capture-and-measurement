@@ -249,12 +249,24 @@ def _gthread_extract_data_tar(deb_path: str) -> str | None:
 
 
 def _gthread_set_ld_path():
-    """Prepend cache dir to LD_LIBRARY_PATH."""
+    """Prepend cache dir to LD_LIBRARY_PATH and preload the .so via ctypes."""
     cur = os.environ.get("LD_LIBRARY_PATH", "")
     if _GTHREAD_DIR not in cur.split(os.pathsep):
         os.environ["LD_LIBRARY_PATH"] = (
             _GTHREAD_DIR + os.pathsep + cur if cur else _GTHREAD_DIR
         )
+    _gthread_log(f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '(empty)')}")
+
+    # Preload with ctypes to register the library in the dynamic linker's
+    # namespace BEFORE cv2's .so is dlopen'd.  This satisfies the NEEDED
+    # dependency on libgthread-2.0.so.0 by SONAME.
+    if os.path.exists(_GTHREAD_SO_PATH):
+        try:
+            import ctypes as _ct
+            _ct.CDLL(_GTHREAD_SO_PATH, mode=_ct.RTLD_GLOBAL | _ct.RTLD_NOW)
+            _gthread_log("Preloaded libgthread-2.0.so.0 into process")
+        except Exception as _e:
+            _gthread_log(f"ctypes preload failed (will rely on LD_LIBRARY_PATH): {_e}")
 
 
 if not _gthread_setup():
