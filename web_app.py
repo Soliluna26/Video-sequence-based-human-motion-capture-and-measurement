@@ -24,14 +24,20 @@ from typing import Dict, List, Optional, Tuple
 # -- Provide libgthread-2.0.so.0 on Debian Trixie (GLib >= 2.72) --
 # opencv-contrib-python (pulled by mediapipe) links libgthread-2.0.so.0
 # which was removed upstream.  Streamlit Cloud runs Debian Trixie where
-# it does not exist.  We download the real .so from Debian Bullseye's
-# libglib2.0-0 package at runtime and make it visible to the dynamic linker.
+# it does not exist.  We first try to download libglib2.0-0 from the
+# bullseye repo via apt, then fall back to Debian archive HTTP mirrors.
 # Bullseye's GLib 2.66 libgthread depends on libglib-2.0.so.0 (same SONAME
-# as Trixie's GLib 2.82 — backward-compatible ABI).
+# as Trixie's GLib 2.82 — backward ABI-compatible).
+import subprocess as _sp  # noqa: E402
+
 _GTHREAD_DIR = "/tmp/mocap_lib"
 _GTHREAD_FLAG = _GTHREAD_DIR + "/.extracted"
 _GTHREAD_SO = "libgthread-2.0.so.0"
 _GTHREAD_SO_PATH = _GTHREAD_DIR + "/" + _GTHREAD_SO
+
+
+def _gthread_log(msg: str):
+    print(f"[mocap] {msg}", file=sys.stderr, flush=True)
 
 
 def _gthread_setup() -> bool:
@@ -39,46 +45,118 @@ def _gthread_setup() -> bool:
     if sys.platform != "linux":
         return False
 
-    # Already done?
+    # Already done in this deployment?
     if os.path.exists(_GTHREAD_FLAG) and os.path.exists(_GTHREAD_SO_PATH):
         _gthread_set_ld_path()
+        _gthread_log("libgthread-2.0.so.0 already cached, LD_LIBRARY_PATH set")
         return True
-
-    # Mirror list for libglib2.0-0_2.66.8-1+deb11u1_amd64.deb (Debian Bullseye)
-    _MIRRORS = [
-        "http://archive.debian.org/debian/pool/main/g/glib2.0/"
-        "libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
-        "http://snapshot.debian.org/archive/debian/20230101T000000Z/"
-        "pool/main/g/glib2.0/libglib2.0-0_2.66.8-1_amd64.deb",
-        "http://ftp.debian.org/debian/pool/main/g/glib2.0/"
-        "libglib2.0-0_2.66.8-1+deb11u1_amd64.deb",
-    ]
 
     os.makedirs(_GTHREAD_DIR, exist_ok=True)
 
-    deb_path = _GTHREAD_DIR + "/._tmp_libglib.deb"
-    for url in _MIRRORS:
-        try:
-            _request.urlretrieve(url, deb_path)
-            if os.path.getsize(deb_path) > 500_000:  # real .deb is ~1.5 MB
-                break
-        except Exception:
-            continue
-    else:
-        return False
+    # --- Strategy 1: apt-get download from Debian Bullseye ---
+    if _gthread_try_apt():
+        _gthread_set_ld_path()
+        return True
 
+    # --- Strategy 2: download .deb via HTTP from archive.debian.org ---
+    if _gthread_try_http():
+        _gthread_set_ld_path()
+        return True
+
+    _gthread_log("All strategies failed — cv2 import will likely crash")
+    return False
+
+
+def _gthread_try_apt() -> bool:
+    """Try: apt-get download libglib2.0-0/bullseye, extract .so."""
+    deb_path = _GTHREAD_DIR + "/._apt_libglib.deb"
+    bullseye_sources = [
+        "deb http://archive.debian.org/debian bullseye main",
+        "deb http://deb.debian.org/debian bullseye main",
+    ]
+    sources_path = "/etc/apt/sources.list.d/mocap_bullseye.list"
     try:
-        # Parse ar archive to extract data.tar.* from the .deb
-        data_tar = _gthread_extract_data_tar(deb_path)
-        if data_tar is None:
+        # Add bullseye source temporarily
+        with open(sources_path, "w") as f:
+            for src in bullseye_sources:
+                f.write(src + "\n")
+        _sp.run(
+            ["apt-get", "update", "-qq"],
+            capture_output=True, timeout=60,
+        )
+        result = _sp.run(
+            ["apt-get", "download", "-qq", "libglib2.0-0/bullseye"],
+            capture_output=True, timeout=60, cwd=_GTHREAD_DIR,
+        )
+        if result.returncode != 0:
+            _gthread_log(f"apt-get download failed: {result.stderr.decode()}")
             return False
+        # Find downloaded .deb
+        for fn in os.listdir(_GTHREAD_DIR):
+            if fn.startswith("libglib2.0-0_") and fn.endswith("_amd64.deb"):
+                os.rename(os.path.join(_GTHREAD_DIR, fn), deb_path)
+                break
+        if not os.path.exists(deb_path) or os.path.getsize(deb_path) < 500_000:
+            _gthread_log("apt-get didn't produce a valid .deb")
+            return False
+        _gthread_log(f"Downloaded .deb via apt: {os.path.getsize(deb_path)} bytes")
+        return _gthread_unpack_deb(deb_path)
+    except Exception as e:
+        _gthread_log(f"apt strategy exception: {e}")
+        return False
+    finally:
+        for p in (deb_path, sources_path):
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
-        # Extract libgthread-2.0.so.0 from the data tarball
+
+def _gthread_try_http() -> bool:
+    """Try: download .deb from Debian archive mirrors via HTTP."""
+    # Multiple version numbers to try (we don't know the exact bullseye rev)
+    _VERSIONS = [
+        "2.66.8-1+deb11u1",
+        "2.66.8-1+deb11u8",
+        "2.66.8-1+deb11u11",
+        "2.66.8-1",
+    ]
+    _HOSTS = [
+        "http://archive.debian.org/debian",
+        "http://deb.debian.org/debian",
+    ]
+    deb_path = _GTHREAD_DIR + "/._http_libglib.deb"
+    for host in _HOSTS:
+        for ver in _VERSIONS:
+            url = f"{host}/pool/main/g/glib2.0/libglib2.0-0_{ver}_amd64.deb"
+            _gthread_log(f"Trying {url} ...")
+            try:
+                _request.urlretrieve(url, deb_path)
+                sz = os.path.getsize(deb_path)
+                _gthread_log(f"Got {sz} bytes")
+                if sz > 500_000:
+                    return _gthread_unpack_deb(deb_path)
+            except Exception as e:
+                _gthread_log(f"HTTP error: {e}")
+                continue
+    return False
+
+
+def _gthread_unpack_deb(deb_path: str) -> bool:
+    """Unpack a .deb and extract libgthread-2.0.so.0."""
+    data_tar = _gthread_extract_data_tar(deb_path)
+    if data_tar is None:
+        _gthread_log("Failed to extract data.tar from .deb (bad ar format?)")
+        return False
+    _gthread_log(f"Extracted data tarball: {os.path.getsize(data_tar)} bytes")
+    try:
+        # Extract .so from data tarball
         extract_dir = tempfile.mkdtemp(dir=_GTHREAD_DIR)
         try:
             with tarfile.open(data_tar, "r:*") as tf:
                 tf.extractall(extract_dir, filter="data")
-            # Walk extract_dir to find and copy the real .so (not symlink)
+            found = False
             for root, _dirs, files in os.walk(extract_dir):
                 for fn in files:
                     if fn == _GTHREAD_SO or fn.startswith(_GTHREAD_SO + "."):
@@ -90,35 +168,39 @@ def _gthread_setup() -> bool:
                                 continue
                         shutil.copy2(fp, _GTHREAD_SO_PATH)
                         os.chmod(_GTHREAD_SO_PATH, 0o755)
+                        _gthread_log(
+                            f"Copied {_GTHREAD_SO} "
+                            f"({os.path.getsize(_GTHREAD_SO_PATH)} bytes)"
+                        )
+                        found = True
                         break
-                else:
-                    continue
-                break
+                if found:
+                    break
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
     finally:
-        for p in (deb_path, data_tar if "data_tar" in dir() else None):
+        for p in (deb_path, data_tar if data_tar and os.path.exists(data_tar) else None):
             if p and os.path.exists(p):
-                os.unlink(p)
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     if not os.path.exists(_GTHREAD_SO_PATH):
+        _gthread_log("libgthread-2.0.so.0 NOT found in .deb data tarball")
         return False
 
-    # Mark success
+    # Mark success for subsequent runs
     with open(_GTHREAD_FLAG, "w") as f:
         f.write("1\n")
-
-    _gthread_set_ld_path()
     return True
 
 
 def _gthread_extract_data_tar(deb_path: str) -> str | None:
-    """Parse a .deb (ar archive) and extract the data.tar.* member.
-
-    Returns path to the extracted data tarball, or None.
-    """
+    """Parse a .deb (ar archive) and extract the data.tar.* member."""
     with open(deb_path, "rb") as f:
         if f.read(8) != b"!<arch>\n":
+            _gthread_log("Not a valid ar archive (missing !<arch> magic)")
             return None
         while True:
             header = f.read(60)
@@ -133,7 +215,7 @@ def _gthread_extract_data_tar(deb_path: str) -> str | None:
                 return None
             data = f.read(size)
             if size % 2 != 0:
-                f.read(1)  # ar padding
+                f.read(1)  # ar padding byte
             if name.startswith("data.tar"):
                 out = _GTHREAD_DIR + "/_data.tar"
                 with open(out, "wb") as wf:
@@ -152,11 +234,7 @@ def _gthread_set_ld_path():
 
 
 if not _gthread_setup():
-    print(
-        "WARNING: Could not provide libgthread-2.0.so.0. "
-        "If cv2 import fails, the Debian mirror may be unreachable.",
-        file=sys.stderr,
-    )
+    _gthread_log("WARNING: libgthread-2.0.so.0 not available")
 
 import cv2
 import numpy as np
