@@ -518,7 +518,8 @@ class MainWindow(QMainWindow):
         # Accumulate and draw detected basketball trajectory (orange).
         # None marks frames where the ball is out of view, so the trail breaks.
         self._ball_trajectory.append(ball_pos)
-        self._draw_ball_trajectory(canvas, self._ball_trajectory)
+        # Temporarily hide the basketball trajectory to focus on body motion.
+        # self._draw_ball_trajectory(canvas, self._ball_trajectory)
 
         # Accumulate and draw manual point trajectories (blue)
         for pid, pos in manual_positions.items():
@@ -729,7 +730,8 @@ class MainWindow(QMainWindow):
                 canvas = self._draw_skeleton(canvas, landmarks, CYAN)
 
             saved_ball.append(ball_pos)
-            self._draw_ball_trajectory(canvas, saved_ball)
+            # Temporarily hide the basketball trajectory to focus on body motion.
+            # self._draw_ball_trajectory(canvas, saved_ball)
 
             # Accumulate and draw manual trajectories
             for pid, pos in manual_positions.items():
