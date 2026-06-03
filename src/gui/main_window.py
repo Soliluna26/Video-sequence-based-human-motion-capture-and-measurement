@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import yaml
-from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -42,7 +41,6 @@ from src.action_recognizer import (
     TemplateStore,
     extract_angle_features,
 )
-import src.action_recognizer as ar_mod
 
 # Skeleton bone connections for drawing (MediaPipe pose connections)
 BONE_CONNECTIONS = [

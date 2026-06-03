@@ -9,7 +9,7 @@ pinned: false
 
 # Video-sequence-based Human Motion Capture and Measurement
 
-基于单目视频的人体运动捕捉与测量系统。输入任意视频，输出人体33个关节点的运动轨迹、关节角度/角速度/角加速度时序数据，支持手动打点追踪任意物体（如篮球），并支持纯黑背景的可视化回放与CSV轨迹导出。
+基于单目视频的人体运动捕捉与测量系统。输入任意视频，输出人体33个关节点的运动轨迹、关节角度/角速度/角加速度时序数据，支持手动打点追踪任意物体（如篮球），支持纯黑背景的可视化回放与CSV轨迹导出，**支持基于DTW模板匹配的少样本动作识别（注册→识别）**。
 
 ## 项目目标
 
@@ -19,6 +19,7 @@ pinned: false
 4. 支持手动点击打点，使用 Lucas-Kanade 光流追踪任意物体（篮球等），计算瞬时速度、累计位移
 5. 提供图形界面进行交互式录制、手动打点与纯黑背景回放
 6. 导出所有追踪点（人体自动点 + 手动点）为CSV格式
+7. **动作模板学习与识别**：提供示例视频注册动作模板，在多动作视频中自动检测并标注已学动作
 
 ## 技术路线
 
@@ -29,16 +30,19 @@ pinned: false
                                ↓
                        运动学计算(角度/速度/加速度)
                                ↓
-                       可视化(轨迹/曲线/热力图/动画)
-                               ↓
-                       数据导出(CSV/JSON/MAT)
+                  ┌────────────┼────────────┐
+                  ↓            ↓            ↓
+           可视化(轨迹/曲线  DTW动作识别  数据导出(CSV/JSON/MAT)
+           /热力图/动画)   (模板匹配+滑动窗口)
 ```
 
 - **姿态估计**：MediaPipe Pose Landmarker（0.10.x Tasks API），33关键点，CPU可运行
-- **手动点追踪**：Lucas-Kanade 金字塔光流（`cv2.calcOpticalFlowPyrLK`），窗口大小41×41，4层金字塔，亚像素精度收敛。点击画面任意位置即可标记并开始追踪
+- **手动点追踪**：Lucas-Kanade 金字塔光流（`cv2.calcOpticalFlowPyrLK`），窗口大小41×41，4层金字塔，亚像素精度收敛
 - **运动学计算**：余弦定理（角度）、中心差分法（角速度/角加速度）、累计欧氏距离（轨迹长度）
-- **GUI框架**：PyQt5 + 侧边栏，QThread后台处理防止界面卡死，鼠标事件过滤支持点击打点
-- **可视化**：Matplotlib（静态图表）、OpenCV（实时绘制/动画渲染）
+- **动作识别**：多维DTW（Dynamic Time Warping）模板匹配 + 多尺度滑动窗口 + 非极大抑制(NMS)，基于10维关节角度特征向量，支持单样本学习
+- **GUI框架**：PyQt5 + 侧边栏，QThread后台处理防止界面卡死，三模式切换（捕捉/注册/识别），鼠标事件过滤支持点击打点
+- **Web界面**：Streamlit，支持云端部署，内嵌动作注册与识别UI
+- **可视化**：Matplotlib（静态图表）、OpenCV（实时绘制/动画渲染/动作标签叠加）
 
 ## 环境配置
 
@@ -49,7 +53,7 @@ cd Video-sequence-based-human-motion-capture-and-measurement
 pip install -r requirements.txt
 ```
 
-依赖：`opencv-python` `opencv-contrib-python` `mediapipe` `PyQt5` `numpy` `scipy` `matplotlib` `Pillow` `PyYAML` `imageio`
+依赖：`opencv-python` `opencv-contrib-python` `mediapipe` `PyQt5` `numpy` `scipy` `matplotlib` `Pillow` `PyYAML` `imageio` `streamlit`
 
 首次运行时会自动下载 MediaPipe Pose Landmarker 模型文件（~10MB），保存在 `~/.mediapipe/models/`。
 
@@ -61,32 +65,62 @@ pip install -r requirements.txt
 python main.py
 ```
 
-操作流程：
+**三种操作模式**（顶部模式栏切换）：
+
+| 模式 | 功能 |
+|------|------|
+| **捕捉** | 原有流程：录视频 → 骨架回放 → 保存/Save Result/Export CSV |
+| **注册** | 录视频 → 输入动作名 → 点击 Register 注册为动作模板 |
+| **识别** | 录视频 → 点击 Recognize → DTW匹配全部模板并标注结果 |
+
+**捕捉模式流程：**
 
 1. 点击 **Open Video**，选择 mp4/avi/mov/gif 视频文件
-2. （可选）点击 **Add Manual Point** 激活打点模式，在画面任意位置点击鼠标左键，添加手动追踪点；可重复添加多个点
+2. （可选）点击 **Add Manual Point** 激活打点模式，在画面任意位置点击鼠标左键，添加手动追踪点
 3. 点击 **Start**，后台开始 MediaPipe 姿态估计 + LK光流追踪手动点，前台显示原视频
 4. 视频结束或点击 **End**，进入回放就绪状态
 5. 点击 **Replay**，纯黑背景回放：
-   - 青色(Cyan)线条和点：人体骨架运动姿态
-   - 蓝色(Blue)连续线条 + 采样点小圆：手动标记点的历史轨迹
+   - 青色线条和点：人体骨架运动姿态
+   - 蓝色连续线条 + 采样点小圆：手动标记点的历史轨迹
    - 蓝色大圆点（实心 + 轮廓）：手动标记点当前位置
    - 左上角实时显示：`Velocity(mm/s)` `Distance(mm)` `Times(s)`
+   - 若已运行识别，画面顶部叠加绿色半透明动作标签
 6. 点击 **Save Result**，将回放动画导出为 MP4 文件
 7. 点击 **Export CSV**，导出所有追踪数据（人体关键点 + 手动点，含类型区分）
 
+**注册模式流程：**
+
+1. Open Video → Start → 等待处理完成
+2. 在右侧 **Action name** 输入框输入动作名（如 `shooting`、`walking`）
+3. 点击 **Register**，系统自动提取10维关节角度特征并归一化保存
+4. 模板保存至 `config/action_templates.json`，右侧信息栏显示已注册模板列表
+
+**识别模式流程：**
+
+1. Open Video → Start → 等待处理完成
+2. 点击 **Recognize**，系统对所有已注册模板运行滑动窗口DTW匹配
+3. 弹窗显示检测结果（动作名、帧范围、时间、置信度）
+4. 点击 **Replay** 回放时，画面顶部自动叠加当前帧对应的动作名称标签
+5. 右侧信息栏持续显示已检测动作列表
+
 **手动点管理：**
-- 录制过程中可随时点击 **Add Manual Point** 添加新追踪点（自动从当前帧开始光流跟踪）
+- 录制过程中可随时点击 **Add Manual Point** 添加新追踪点
 - 右侧侧边栏显示所有手动点列表，每个点有红色删除按钮
-- 光流跟丢后该点自动停用，旧轨迹保留在画面中；重新打点即可开始新轨迹
-- 轨迹的每个采样点上画出蓝色小圆点，便于观察跟踪精度
+- 光流跟丢后该点自动停用，旧轨迹保留在画面中
 
 ### CLI 命令行模式（批量处理）
 
 ```bash
+# 基础运动学分析
 python main.py --input data/sample.mp4 --max_frames 200
 python main.py --input data/sample.mp4 --output_dir results/ --export_format csv,json,mat
 python main.py --input data/sample.gif --no_animation
+
+# 注册动作模板
+python main.py --input shooting_example.mp4 --register --action_name "shooting"
+
+# 识别动作
+python main.py --input multi_action.mp4 --recognize --templates config/action_templates.json --sensitivity 2.0
 ```
 
 | 参数 | 说明 | 默认值 |
@@ -96,6 +130,11 @@ python main.py --input data/sample.gif --no_animation
 | `--output_dir` | 输出目录 | `output/` |
 | `--export_format` | 导出格式(csv,json,mat) | `csv,json` |
 | `--no_animation` | 跳过动画生成 | False |
+| `--register` | 将输入视频注册为动作模板 | - |
+| `--action_name` | 注册时的动作名称（配合`--register`） | - |
+| `--recognize` | 在输入视频中识别已注册动作 | - |
+| `--templates` | 动作模板JSON路径 | `config/action_templates.json` |
+| `--sensitivity` | DTW阈值灵敏度（越低越严格） | 2.0 |
 
 CLI 模式的输出文件：
 
@@ -114,13 +153,15 @@ output/
 ## 项目结构
 
 ```
-├── main.py                  # 主入口（GUI + CLI 双模式）
+├── main.py                  # 主入口（GUI + CLI 双模式，动作识别CLI支持）
+├── web_app.py               # Streamlit Web应用（含动作注册/识别UI）
 ├── requirements.txt
 ├── config/
-│   └── landmarks.yaml       # 33关键点定义 + 10种关节角度配置 + 骨骼连接
+│   ├── landmarks.yaml       # 33关键点定义 + 10种关节角度配置 + 骨骼连接
+│   └── action_templates.json # 动作模板库持久化文件
 ├── src/
 │   ├── gui/
-│   │   ├── main_window.py   # PyQt5主窗口（侧边栏、鼠标打点、轨迹渲染、CSV导出）
+│   │   ├── main_window.py   # PyQt5主窗口（三模式切换、侧边栏、打点、AR面板）
 │   │   └── video_worker.py  # QThread后台处理线程（MediaPipe + LK光流追踪）
 │   ├── frame_loader.py      # 视频/GIF帧读取
 │   ├── pose_estimator.py    # MediaPipe姿态估计封装
@@ -128,12 +169,59 @@ output/
 │   ├── ball_tracker.py      # HSV篮球追踪（保留供CLI模式使用）
 │   ├── tracker.py           # 关节点轨迹追踪与插值
 │   ├── kinematics.py        # 运动学计算（角度/角速度/角加速度/轨迹长度/ROM）
+│   ├── action_recognizer.py # 动作识别核心（DTW / 模板管理 / 滑动窗口检测 / NMS）
 │   ├── analyzer.py          # 动作分析（峰值检测/对称性/傅里叶分析）
 │   ├── visualizer.py        # 可视化（5种图表 + 轨迹叠加动画）
 │   └── exporter.py          # 数据导出（CSV/JSON/MAT）
 └── tests/
-    └── test_kinematics.py   # 运动学模块单元测试（18项）
+    ├── test_kinematics.py       # 运动学模块单元测试（18项）
+    └── test_action_recognizer.py # 动作识别模块单元测试（29项）
 ```
+
+## 动作识别 — 技术路径
+
+### 设计选择：DTW 模板匹配
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **DTW模板匹配** ✅ | 单样本学习、CPU友好、可解释、天然处理变速 | 对视角变化敏感 |
+| LSTM/TCN深度学习 | 端到端、泛化能力强 | 需大量标注数据、GPU依赖 |
+| 特征工程+SVM | 推理快、可解释 | 需手动分割动作段、需多示例 |
+
+本项目选择DTW，因为：
+- 只需**一个示例视频**即可注册动作模板（符合"提供视频学习典型动作"的需求）
+- 多维DTW自动对齐时间轴，不同人做同一动作的速度差异被自动吸收
+- 10维关节角度序列的DTW计算在CPU上极快（~1ms/匹配）
+- 架构预留了分类器替换接口，后续可升级为LSTM/1D-CNN
+
+### 核心算法
+
+**特征向量**（复用现有管线，每帧10维）：
+
+```
+[left_knee, right_knee, left_elbow, right_elbow, left_hip,
+ right_hip, left_shoulder, right_shoulder, left_ankle, right_ankle]
+```
+
+**模板归一化**（注册时）：
+1. NaN线性插值
+2. 时间重采样至固定60帧（`np.interp`），消除绝对速度差异
+3. 逐维度去均值，使DTW关注形状而非绝对角度值
+
+**滑动窗口检测**（识别时）：
+```
+窗口长度 = template_length × [0.5, 2.0]（多尺度，步长0.25）
+步长 = 5 帧
+```
+对每个窗口段：与所有模板计算DTW距离 → 若 `distance < threshold`，记录匹配 → 非极大抑制(NMS)去除重叠冗余
+
+**自适应阈值**：`threshold = max(RMS(template) × 0.5 × sensitivity, 1.0)`，其中 `RMS` 为模板特征的能量度量。`sensitivity` 参数用户可在GUI中调整（1.0=严格, 5.0=宽松）。
+
+### 局限与未来方向
+
+- DTW对视角变化敏感（需同一相机位姿），后续可加入视角归一化
+- 单模板 → 多模板：同一动作可注册多个示例，用最近邻DTW投票
+- 架构已预留分类器接口，可替换为轻量神经网络
 
 ## 运动学计算公式
 
@@ -217,18 +305,29 @@ frame_idx, time_sec, point_type, point_id, name, x, y
 ## 单元测试
 
 ```bash
+# 全部测试（47项）
+python -m pytest tests/ -v
+
+# 仅运动学模块（18项）
 python -m pytest tests/test_kinematics.py -v
+
+# 仅动作识别模块（29项）
+python -m pytest tests/test_action_recognizer.py -v
 ```
 
-覆盖6个测试类18项测试：角度计算（直角/平角/锐角/退化解）、角速度（常值/正弦解析对比）、角加速度（正弦二阶导对比）、轨迹长度（直线/对角线/NaN处理）、ROM、平滑。
+| 测试模块 | 测试类 | 测试数 | 覆盖内容 |
+|---------|--------|--------|---------|
+| `test_kinematics.py` | 7 | 18 | 角度计算(6)、角速度(2)、角加速度(1)、轨迹长度(4)、ROM(2)、批量角度(1)、平滑(2) |
+| `test_action_recognizer.py` | 9 | 29 | DTW距离(5)、归一化(4)、NaN填充(2)、时间重采样(2)、模板序列化(1)、模板库CRUD(6)、识别器集成(4)、NMS(3)、特征提取(2) |
 
 ## 实际测试数据
 
 在篮球视频（548×520, 30fps, 557帧）上的测试结果：
 
-- **姿态检测率**：98%（49/50帧通过，实测100帧中99帧检测成功）
-- **手动点追踪**：LK光流逐帧跟踪，参数可调；用户可根据需要标记任意物体
+- **姿态检测率**：98%（100帧中99帧检测成功）
+- **手动点追踪**：LK光流逐帧跟踪，参数可调
 - **处理速度**：约5-8 fps（CPU，取决于机器性能）
+- **动作识别**：投篮模板自识别置信度 ~68%，正确框定frame 5-95
 
 ## 已知限制
 
@@ -239,9 +338,11 @@ python -m pytest tests/test_kinematics.py -v
 5. **GIF精度**：GIF无标准FPS字段，默认按30fps处理
 6. **速度计算**：移动平均平滑会引入约2-3帧的滞后
 7. **光流漂移**：LK光流跟踪的是纹理特征而非物体质心，物体旋转或变形时可能逐渐漂移
+8. **DTW视角敏感**：动作识别依赖关节角度形状，不同拍摄角度下同一动作的角度曲线可能差异较大
 
 ## 参考
 
 - MediaPipe Pose Landmarker: https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
+- Lucas, B.D. & Kanade, T. (1981). An Iterative Image Registration Technique with an Application to Stereo Vision. *IJCAI'81*.
 - Winter, D.A. (2009). *Biomechanics and Motor Control of Human Movement* (4th ed.). Wiley.
 - Sports2D: https://github.com/sportstech/Sports2D
