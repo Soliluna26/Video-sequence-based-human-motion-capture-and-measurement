@@ -27,6 +27,13 @@ from src.frame_loader import FrameLoader
 from src.pose_estimator import PoseEstimator, KEYPOINT_NAMES, PoseResult
 from src.ball_tracker import BallTracker
 from src.point_manager import PointManager
+from src.action_recognizer import (
+    ActionRecognizer,
+    TemplateStore,
+    extract_angle_features,
+    ANGLE_KEYS,
+)
+import yaml
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -112,6 +119,46 @@ def draw_trajectories(
             p1 = (int(np.clip(x1, 0, w - 1)), int(np.clip(y1, 0, h - 1)))
             p2 = (int(np.clip(x2, 0, w - 1)), int(np.clip(y2, 0, h - 1)))
             cv2.line(canvas, p1, p2, color, 2)
+    return canvas
+
+
+def draw_action_labels(
+    canvas: np.ndarray,
+    action_matches: list,
+    current_frame: int,
+) -> np.ndarray:
+    """Overlay action name labels when current_frame falls within a match.
+
+    Parameters
+    ----------
+    canvas : np.ndarray
+        BGR image to draw on.
+    action_matches : list of ActionMatch
+    current_frame : int
+
+    Returns
+    -------
+    canvas : np.ndarray
+    """
+    if not action_matches:
+        return canvas
+    h, w = canvas.shape[:2]
+    for m in action_matches:
+        if m.start_frame <= current_frame <= m.end_frame:
+            # Draw semi-transparent banner at top
+            overlay = canvas.copy()
+            banner_h = 50
+            cv2.rectangle(overlay, (0, 0), (w, banner_h), (0, 100, 0), -1)
+            cv2.addWeighted(overlay, 0.5, canvas, 0.5, 0, canvas)
+            # Action name + confidence
+            text = f"{m.action_name} ({m.confidence:.0%})"
+            font_scale = 1.0
+            thickness = 2
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+            tx = (w - tw) // 2
+            ty = (banner_h + th) // 2
+            cv2.putText(canvas, text, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return canvas
 
 
@@ -414,6 +461,11 @@ def init_session_state():
         "next_manual_id": 0,
         "pending_manual_points": {},
         "processing_error": None,
+        # Action recognition
+        "action_store": None,         # TemplateStore instance
+        "action_matches": [],          # List[ActionMatch]
+        "action_register_name": "",
+        "templates_path": "config/action_templates.json",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -591,6 +643,37 @@ def main():
                     st.rerun()
 
         st.divider()
+        st.subheader("4. Action Recognition")
+        action_name = st.text_input("Action name", key="ar_name",
+                                     placeholder="e.g. shooting, walking, jumping")
+        col_ar1, col_ar2 = st.columns(2)
+        with col_ar1:
+            if st.button("📝 Register", use_container_width=True, key="btn_register",
+                         disabled=not bool(action_name.strip())):
+                ss._do_register = True
+                ss.action_register_name = action_name.strip()
+                st.rerun()
+        with col_ar2:
+            if st.button("🔍 Recognize", use_container_width=True, key="btn_recognize"):
+                ss._do_recognize = True
+                st.rerun()
+        # Show loaded templates
+        if ss.action_store is not None and len(ss.action_store) > 0:
+            st.caption(f"📚 {len(ss.action_store)} template(s) loaded")
+            for tmpl in ss.action_store.templates:
+                col_t1, col_t2 = st.columns([3, 1])
+                with col_t1:
+                    st.caption(f"  • {tmpl.name}")
+                with col_t2:
+                    if st.button("✕", key=f"del_tmpl_{tmpl.template_id}"):
+                        ss.action_store.remove(tmpl.template_id)
+                        ss.action_store.save(ss.templates_path)
+                        st.rerun()
+        sensitivity = st.slider("Sensitivity", 1.0, 5.0, 2.0, 0.1,
+                                key="ar_sensitivity",
+                                help="Lower = stricter matching")
+
+        st.divider()
         st.caption("Powered by MediaPipe + OpenCV")
 
     # ================================================================
@@ -748,6 +831,67 @@ def main():
     if T == 0:
         return
 
+    # --- Action Recognition processing ---
+    if getattr(ss, "_do_register", False) or getattr(ss, "_do_recognize", False):
+        # Lazy-init store
+        if ss.action_store is None:
+            ss.action_store = TemplateStore(target_len=60)
+            tp = ss.templates_path
+            if os.path.exists(tp):
+                ss.action_store.load(tp)
+
+        # Load angle definitions from config
+        config_path = Path("config/landmarks.yaml")
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            angle_defs = {name: tuple(indices)
+                          for name, indices in config.get("angle_definitions", {}).items()}
+        else:
+            angle_defs = {}
+
+        # Build positions array from poses
+        T_frames = len(ss.poses)
+        positions = np.full((T_frames, 33, 2), np.nan, dtype=np.float64)
+        for i, pose in enumerate(ss.poses):
+            if pose is not None:
+                for ki in range(min(33, len(pose))):
+                    positions[i, ki, 0] = pose[ki][0]
+                    positions[i, ki, 1] = pose[ki][1]
+        # Interpolate and smooth
+        from src.tracker import Tracker
+        tracker = Tracker()
+        tracker.add_frames(ss.poses)
+        positions = tracker.interpolate()
+        positions_smooth = tracker.smooth(positions, window=5)
+
+        if getattr(ss, "_do_register", False):
+            ss._do_register = False
+            action_name = ss.action_register_name
+            if action_name and angle_defs:
+                feat = extract_angle_features(positions_smooth, angle_defs, window=5)
+                ss.action_store.add(feat, action_name, ss.fps)
+                ss.action_store.save(ss.templates_path)
+                st.toast(f"Action '{action_name}' registered!", icon="✅")
+                st.rerun()
+
+        if getattr(ss, "_do_recognize", False):
+            ss._do_recognize = False
+            if len(ss.action_store) > 0 and angle_defs:
+                feat = extract_angle_features(positions_smooth, angle_defs, window=5)
+                recognizer = ActionRecognizer(
+                    ss.action_store, sensitivity=_s("ar_sensitivity", 2.0),
+                )
+                ss.action_matches = recognizer.recognize(feat, ss.fps)
+                if ss.action_matches:
+                    st.toast(f"Detected {len(ss.action_matches)} action(s)!", icon="🔍")
+                else:
+                    st.toast("No actions detected.", icon="ℹ️")
+            else:
+                ss.action_matches = []
+                st.toast("No templates loaded. Register one first.", icon="⚠️")
+            st.rerun()
+
     # --- Replay generation ---
     if getattr(ss, "_do_replay", False):
         ss._do_replay = False
@@ -849,6 +993,9 @@ def main():
         ball_trajectory=ball_traj,
         vel_mm_s=vel, dist_mm=dist, elapsed_s=elapsed,
     )
+    # Draw action labels on current frame
+    if ss.action_matches:
+        overlaid = draw_action_labels(overlaid, ss.action_matches, fidx)
 
     col_img, col_info = st.columns([3, 1])
     with col_img:
@@ -878,6 +1025,15 @@ def main():
             st.caption(f"Keypoints: {nk}/33")
         if ball_pos is not None:
             st.caption(f"Ball: ({ball_pos[0]:.0f}, {ball_pos[1]:.0f})")
+        # Show active action at current frame
+        if ss.action_matches:
+            active = [m for m in ss.action_matches
+                      if m.start_frame <= fidx <= m.end_frame]
+            if active:
+                st.divider()
+                st.markdown("**🎬 Current Action**")
+                for m in active:
+                    st.caption(f"{m.action_name} ({m.confidence:.0%})")
         if ss.manual_tracks:
             st.divider()
             st.markdown("**Manual Points**")
@@ -896,6 +1052,18 @@ def main():
         st.info("Point Mode ON — click image to add tracking points")
     else:
         st.caption("Check Point Mode to add tracking markers")
+
+    # --- Action Recognition Results ---
+    if ss.action_matches:
+        st.divider()
+        st.markdown("### 🎬 Detected Actions")
+        for m in ss.action_matches:
+            st.markdown(
+                f"**{m.action_name}** | "
+                f"frame {m.start_frame}–{m.end_frame} | "
+                f"time {m.start_sec:.1f}s–{m.end_sec:.1f}s | "
+                f"confidence {m.confidence:.0%}"
+            )
 
     # --- CSV Export ---
     if getattr(ss, "_do_csv", False):

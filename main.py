@@ -20,23 +20,35 @@ def run_gui():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # Dark stylesheet
+    # Dark stylesheet — large fonts & buttons
     app.setStyleSheet("""
         QMainWindow { background-color: #1e1e1e; }
-        QLabel { color: #cccccc; }
+        QLabel { color: #cccccc; font-size: 18px; }
         QPushButton {
             background-color: #3a3a3a; color: #e0e0e0;
-            border: 1px solid #555; border-radius: 4px;
-            padding: 6px 16px; font-size: 13px;
+            border: 2px solid #555; border-radius: 6px;
+            padding: 12px 28px; font-size: 22px; font-weight: bold;
         }
         QPushButton:hover { background-color: #4a4a4a; }
         QPushButton:pressed { background-color: #2a2a2a; }
         QPushButton:disabled { background-color: #2a2a2a; color: #666; }
+        QPushButton:checked { background-color: #005a9e; border-color: #0078d4; }
         QProgressBar {
             border: 1px solid #555; border-radius: 3px;
             background-color: #2a2a2a; text-align: center; color: #ccc;
+            font-size: 16px;
         }
         QProgressBar::chunk { background-color: #0078d4; border-radius: 2px; }
+        QLineEdit {
+            background-color: #2a2a2a; color: #e0e0e0;
+            border: 2px solid #555; border-radius: 6px;
+            padding: 10px 16px; font-size: 22px;
+        }
+        QListWidget {
+            background-color: #2a2a2a; border: 1px solid #555;
+            color: #ccc; font-size: 16px;
+        }
+        QListWidget::item { padding: 4px; }
     """)
 
     window = MainWindow()
@@ -81,6 +93,17 @@ def run_cli():
     parser.add_argument("--export_format", default="csv,json")
     parser.add_argument("--no_animation", action="store_true")
     parser.add_argument("--config", default="config/landmarks.yaml")
+    # Action recognition
+    parser.add_argument("--register", action="store_true",
+                        help="Register the input video as an action template")
+    parser.add_argument("--action_name", default=None,
+                        help="Action name for registration (required with --register)")
+    parser.add_argument("--recognize", action="store_true",
+                        help="Recognize actions in the input video using saved templates")
+    parser.add_argument("--templates", default="config/action_templates.json",
+                        help="Path to action templates JSON file")
+    parser.add_argument("--sensitivity", type=float, default=2.0,
+                        help="DTW threshold multiplier (lower=stricter, default 2.0)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -190,6 +213,49 @@ def run_cli():
             export_mat(mat_data, str(output_dir / "kinematics.mat"))
         except Exception as e:
             print(f"       [WARN] MAT export failed: {e}")
+
+    # ---- Action recognition (optional) ---------------------------------
+    if args.register or args.recognize:
+        from src.action_recognizer import (
+            ActionRecognizer,
+            TemplateStore,
+            extract_angle_features,
+            ANGLE_KEYS,
+        )
+
+        store = TemplateStore(target_len=60)
+        templates_path = Path(args.templates)
+        if templates_path.exists():
+            store.load(str(templates_path))
+            print(f"\n[Action] Loaded {len(store)} template(s) from {templates_path}")
+
+        if args.register:
+            if not args.action_name:
+                print("[Action] ERROR: --action_name is required with --register")
+                return 1
+            # Extract the full-video angle matrix
+            feat = extract_angle_features(positions_smooth, angle_defs, window=5)
+            store.add(feat, args.action_name, fps)
+            store.save(str(templates_path))
+            print(f"[Action] Registered template '{args.action_name}' "
+                  f"({len(store)} total). Saved to {templates_path}")
+
+        if args.recognize:
+            if len(store) == 0:
+                print("[Action] No templates loaded. Register one first with --register --action_name <name>")
+            else:
+                feat = extract_angle_features(positions_smooth, angle_defs, window=5)
+                recognizer = ActionRecognizer(store, sensitivity=args.sensitivity)
+                matches = recognizer.recognize(feat, fps)
+                if matches:
+                    print(f"\n[Action] Detected {len(matches)} action(s):")
+                    for m in matches:
+                        print(f"  * {m.action_name:12s} | "
+                              f"frame {m.start_frame:4d}-{m.end_frame:4d} | "
+                              f"time {m.start_sec:.1f}s-{m.end_sec:.1f}s | "
+                              f"confidence {m.confidence:.2%}")
+                else:
+                    print("[Action] No actions detected.")
 
     print(f"\nDone! Results saved to: {output_dir.resolve()}")
     return 0

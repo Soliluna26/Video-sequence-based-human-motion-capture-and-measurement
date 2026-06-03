@@ -13,6 +13,9 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import yaml
+from pathlib import Path
+
 from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
@@ -20,6 +23,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -33,6 +37,12 @@ from PyQt5.QtWidgets import (
 from src.gui.video_worker import VideoWorker
 from src.point_manager import PointManager
 from src.pose_estimator import KEYPOINT_NAMES, PoseResult
+from src.action_recognizer import (
+    ActionRecognizer,
+    TemplateStore,
+    extract_angle_features,
+)
+import src.action_recognizer as ar_mod
 
 # Skeleton bone connections for drawing (MediaPipe pose connections)
 BONE_CONNECTIONS = [
@@ -68,6 +78,7 @@ class MainWindow(QMainWindow):
         self.fps: float = 30.0
         self.frame_count: int = 0
         self.mode: str = "IDLE"  # IDLE | RECORDING | REPLAY_READY | REPLAY
+        self.op_mode: str = "capture"  # capture | register | recognize
         self.mm_per_pixel: float = DEFAULT_MM_PER_PIXEL
 
         # Recording data: (frame_idx, frame_bgr, landmarks, ball_pos, manual_positions)
@@ -100,6 +111,15 @@ class MainWindow(QMainWindow):
         # Worker thread
         self._worker: Optional[VideoWorker] = None
 
+        # Action recognition state
+        self._action_store: Optional[TemplateStore] = None
+        self._action_matches: List = []
+        self._templates_path: str = str(
+            Path(__file__).resolve().parent.parent.parent / "config" / "action_templates.json"
+        )
+        self._positions_smooth: Optional[np.ndarray] = None  # cached for registration/recognition
+        self._angle_defs: dict = {}
+
         self._setup_ui()
         self._set_button_states()
 
@@ -108,13 +128,50 @@ class MainWindow(QMainWindow):
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
+        main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(12)
 
-        # ---- Left panel: video + progress + buttons ----
+        # ---- Mode selector bar ----
+        mode_layout = QHBoxLayout()
+        mode_layout.setSpacing(16)
+
+        mode_label = QLabel("Mode:")
+        mode_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #ccc;")
+        mode_layout.addWidget(mode_label)
+
+        self.btn_capture = QPushButton("捕捉")
+        self.btn_capture.setCheckable(True)
+        self.btn_capture.setChecked(True)
+        self.btn_capture.clicked.connect(lambda: self._on_switch_mode("capture"))
+        self.btn_capture.setMinimumHeight(52)
+        self.btn_capture.setMinimumWidth(160)
+        mode_layout.addWidget(self.btn_capture)
+
+        self.btn_register = QPushButton("注册")
+        self.btn_register.setCheckable(True)
+        self.btn_register.clicked.connect(lambda: self._on_switch_mode("register"))
+        self.btn_register.setMinimumHeight(52)
+        self.btn_register.setMinimumWidth(160)
+        mode_layout.addWidget(self.btn_register)
+
+        self.btn_recognize = QPushButton("识别")
+        self.btn_recognize.setCheckable(True)
+        self.btn_recognize.clicked.connect(lambda: self._on_switch_mode("recognize"))
+        self.btn_recognize.setMinimumHeight(52)
+        self.btn_recognize.setMinimumWidth(160)
+        mode_layout.addWidget(self.btn_recognize)
+
+        mode_layout.addStretch()
+        main_layout.addLayout(mode_layout)
+
+        # ---- Body: left panel + right sidebar ----
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(12)
+
+        # ==== Left panel: video + progress + buttons ====
         left_panel = QVBoxLayout()
-        left_panel.setSpacing(8)
+        left_panel.setSpacing(10)
 
         # Video display
         self.video_label = QLabel()
@@ -129,54 +186,102 @@ class MainWindow(QMainWindow):
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_bar.setMinimumHeight(28)
         left_panel.addWidget(self.progress_bar)
 
-        # Button row
+        # ---- Button row (common) ----
         btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(12)
+        btn_layout.setSpacing(16)
 
         self.btn_open = QPushButton("Open Video")
         self.btn_open.clicked.connect(self._on_open)
+        self.btn_open.setMinimumHeight(52)
+        self.btn_open.setMinimumWidth(160)
         btn_layout.addWidget(self.btn_open)
 
         self.btn_start = QPushButton("Start")
         self.btn_start.clicked.connect(self._on_start)
+        self.btn_start.setMinimumHeight(52)
+        self.btn_start.setMinimumWidth(130)
         btn_layout.addWidget(self.btn_start)
 
         self.btn_end = QPushButton("End")
         self.btn_end.clicked.connect(self._on_end)
+        self.btn_end.setMinimumHeight(52)
+        self.btn_end.setMinimumWidth(130)
         btn_layout.addWidget(self.btn_end)
 
+        # Mode-specific widgets
+        self._capture_btns: List[QWidget] = []
+        self._register_btns: List[QWidget] = []
+        self._recognize_btns: List[QWidget] = []
+
+        # Capture-only buttons
         self.btn_save = QPushButton("Save Result")
         self.btn_save.clicked.connect(self._on_save)
+        self.btn_save.setMinimumHeight(52)
+        self.btn_save.setMinimumWidth(160)
         btn_layout.addWidget(self.btn_save)
+        self._capture_btns.append(self.btn_save)
 
         self.btn_replay = QPushButton("Replay")
         self.btn_replay.clicked.connect(self._on_replay)
+        self.btn_replay.setMinimumHeight(52)
+        self.btn_replay.setMinimumWidth(130)
         btn_layout.addWidget(self.btn_replay)
+        self._capture_btns.append(self.btn_replay)
+
+        # Register-only widgets
+        self.action_name_input = QLineEdit()
+        self.action_name_input.setPlaceholderText("Action name (e.g. shooting)")
+        self.action_name_input.setMinimumHeight(52)
+        self.action_name_input.setMinimumWidth(250)
+        self.action_name_input.setVisible(False)
+        btn_layout.addWidget(self.action_name_input)
+        self._register_btns.append(self.action_name_input)
+
+        self.btn_do_register = QPushButton("Register")
+        self.btn_do_register.clicked.connect(self._on_register_action)
+        self.btn_do_register.setMinimumHeight(52)
+        self.btn_do_register.setMinimumWidth(160)
+        self.btn_do_register.setVisible(False)
+        btn_layout.addWidget(self.btn_do_register)
+        self._register_btns.append(self.btn_do_register)
+
+        # Recognize-only buttons
+        self.btn_do_recognize = QPushButton("Recognize")
+        self.btn_do_recognize.clicked.connect(self._on_recognize_actions)
+        self.btn_do_recognize.setMinimumHeight(52)
+        self.btn_do_recognize.setMinimumWidth(160)
+        self.btn_do_recognize.setVisible(False)
+        btn_layout.addWidget(self.btn_do_recognize)
+        self._recognize_btns.append(self.btn_do_recognize)
 
         self.btn_exit = QPushButton("Exit")
         self.btn_exit.clicked.connect(self.close)
+        self.btn_exit.setMinimumHeight(52)
+        self.btn_exit.setMinimumWidth(130)
         btn_layout.addWidget(self.btn_exit)
 
         left_panel.addLayout(btn_layout)
+        body_layout.addLayout(left_panel, stretch=1)
 
-        main_layout.addLayout(left_panel, stretch=1)
-
-        # ---- Right sidebar ----
+        # ==== Right sidebar ====
         sidebar = QVBoxLayout()
-        sidebar.setSpacing(8)
+        sidebar.setSpacing(10)
 
         sidebar_title = QLabel("Manual Points")
-        sidebar_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ccc;")
+        sidebar_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #ccc;")
         sidebar.addWidget(sidebar_title)
 
         self.btn_add_point = QPushButton("Add Manual Point")
         self.btn_add_point.setCheckable(True)
         self.btn_add_point.clicked.connect(self._on_toggle_add_point)
+        self.btn_add_point.setMinimumHeight(44)
         self.btn_add_point.setStyleSheet(
             "QPushButton { background-color: #3a3a3a; color: #e0e0e0; "
-            "border: 1px solid #555; border-radius: 4px; padding: 6px 12px; }"
+            "border: 2px solid #555; border-radius: 6px; padding: 10px 18px; "
+            "font-size: 18px; font-weight: bold; }"
             "QPushButton:checked { background-color: #005a9e; border-color: #0078d4; }"
             "QPushButton:hover { background-color: #4a4a4a; }"
             "QPushButton:disabled { background-color: #2a2a2a; color: #666; }"
@@ -185,25 +290,26 @@ class MainWindow(QMainWindow):
 
         self.btn_export_csv = QPushButton("Export CSV")
         self.btn_export_csv.clicked.connect(self._on_export_csv)
+        self.btn_export_csv.setMinimumHeight(44)
         sidebar.addWidget(self.btn_export_csv)
 
         self.manual_points_list = QListWidget()
-        self.manual_points_list.setMinimumWidth(180)
-        self.manual_points_list.setStyleSheet(
-            "QListWidget { background-color: #2a2a2a; border: 1px solid #555; color: #ccc; }"
-            "QListWidget::item { padding: 2px; }"
-        )
+        self.manual_points_list.setMinimumWidth(200)
         sidebar.addWidget(self.manual_points_list, stretch=1)
+
+        # Action recognition info area
+        self.ar_info_label = QLabel("")
+        self.ar_info_label.setWordWrap(True)
+        self.ar_info_label.setStyleSheet("font-size: 16px; color: #8af; padding: 4px;")
+        sidebar.addWidget(self.ar_info_label)
 
         # Wrap sidebar in a widget with fixed width
         sidebar_widget = QWidget()
         sidebar_widget.setLayout(sidebar)
-        sidebar_widget.setMaximumWidth(240)
-        main_layout.addWidget(sidebar_widget)
+        sidebar_widget.setMaximumWidth(280)
+        body_layout.addWidget(sidebar_widget)
 
-        # Style buttons
-        for btn in [self.btn_start, self.btn_end, self.btn_save, self.btn_replay]:
-            btn.setMinimumWidth(90)
+        main_layout.addLayout(body_layout, stretch=1)
 
     def _set_button_states(self):
         """Update button enabled states based on current mode."""
@@ -214,11 +320,135 @@ class MainWindow(QMainWindow):
         self.btn_open.setEnabled(is_idle or is_replay_ready)
         self.btn_start.setEnabled((is_idle or is_replay_ready) and self.video_path is not None)
         self.btn_end.setEnabled(is_recording)
-        self.btn_save.setEnabled(is_replay_ready)
-        self.btn_replay.setEnabled(is_replay_ready)
         self.btn_add_point.setEnabled(self.video_path is not None and not self.mode == "REPLAY")
         self.btn_export_csv.setEnabled(is_replay_ready)
         self.progress_bar.setVisible(is_recording)
+
+        # Capture mode buttons
+        for w in self._capture_btns:
+            w.setVisible(self.op_mode == "capture")
+        self.btn_save.setEnabled(is_replay_ready and self.op_mode == "capture")
+        self.btn_replay.setEnabled(is_replay_ready and self.op_mode == "capture")
+
+        # Register mode buttons
+        for w in self._register_btns:
+            w.setVisible(self.op_mode == "register")
+        self.btn_do_register.setEnabled(
+            self.op_mode == "register" and is_replay_ready and
+            bool(self.action_name_input.text().strip())
+        )
+        self.action_name_input.setEnabled(
+            self.op_mode == "register" and not is_recording
+        )
+
+        # Recognize mode buttons
+        for w in self._recognize_btns:
+            w.setVisible(self.op_mode == "recognize")
+        self.btn_do_recognize.setEnabled(
+            self.op_mode == "recognize" and is_replay_ready
+        )
+
+        # Mode toggle buttons
+        self.btn_capture.setChecked(self.op_mode == "capture")
+        self.btn_register.setChecked(self.op_mode == "register")
+        self.btn_recognize.setChecked(self.op_mode == "recognize")
+
+    # --------------- Mode Switching ---------------
+
+    def _on_switch_mode(self, op_mode: str):
+        """Switch between capture / register / recognize modes."""
+        if self.mode == "RECORDING":
+            return  # can't switch while recording
+        self.op_mode = op_mode
+        self._set_button_states()
+
+    # --------------- Action Recognition ---------------
+
+    def _ensure_action_store(self):
+        """Lazy-init the template store and load from disk."""
+        if self._action_store is None:
+            self._action_store = TemplateStore(target_len=60)
+            tp = self._templates_path
+            if os.path.exists(tp):
+                try:
+                    self._action_store.load(tp)
+                except Exception:
+                    pass
+        return self._action_store
+
+    def _on_register_action(self):
+        """Register the processed recording as a new action template."""
+        name = self.action_name_input.text().strip()
+        if not name or self._positions_smooth is None:
+            QMessageBox.warning(self, "Register", "Please enter an action name and process a video first.")
+            return
+
+        if not self._angle_defs:
+            self._load_angle_defs()
+
+        feats = extract_angle_features(self._positions_smooth, self._angle_defs, window=5)
+        store = self._ensure_action_store()
+        store.add(feats, name, self.fps)
+        store.save(self._templates_path)
+        QMessageBox.information(
+            self, "Registered",
+            f"Action '{name}' registered!\nTotal templates: {len(store)}"
+        )
+        self._update_ar_info()
+
+    def _on_recognize_actions(self):
+        """Run action recognition on the processed recording."""
+        if self._positions_smooth is None:
+            QMessageBox.warning(self, "Recognize", "Please process a video first.")
+            return
+
+        if not self._angle_defs:
+            self._load_angle_defs()
+
+        store = self._ensure_action_store()
+        if len(store) == 0:
+            QMessageBox.information(self, "Recognize", "No templates loaded. Register an action first.")
+            return
+
+        feats = extract_angle_features(self._positions_smooth, self._angle_defs, window=5)
+        rec = ActionRecognizer(store, sensitivity=2.0)
+        self._action_matches = rec.recognize(feats, self.fps)
+
+        if self._action_matches:
+            msg = f"Detected {len(self._action_matches)} action(s):\n"
+            for m in self._action_matches:
+                msg += (f"  * {m.action_name} | "
+                        f"frame {m.start_frame}-{m.end_frame} | "
+                        f"time {m.start_sec:.1f}s-{m.end_sec:.1f}s | "
+                        f"confidence {m.confidence:.0%}\n")
+            QMessageBox.information(self, "Recognition Results", msg)
+        else:
+            QMessageBox.information(self, "Recognition Results", "No actions detected.")
+        self._update_ar_info()
+
+    def _load_angle_defs(self):
+        """Load angle definitions from landmarks.yaml."""
+        config_path = Path(__file__).resolve().parent.parent.parent / "config" / "landmarks.yaml"
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            self._angle_defs = {
+                name: tuple(indices)
+                for name, indices in config.get("angle_definitions", {}).items()
+            }
+
+    def _update_ar_info(self):
+        """Update the action recognition info label in the sidebar."""
+        parts = []
+        if self._action_store and len(self._action_store) > 0:
+            parts.append(f"Templates: {len(self._action_store)}")
+            for tmpl in self._action_store.templates:
+                parts.append(f"  - {tmpl.name}")
+        if self._action_matches:
+            parts.append(f"Detected: {len(self._action_matches)}")
+            for m in self._action_matches:
+                parts.append(f"  [{m.action_name}] f{m.start_frame}-{m.end_frame}")
+        self.ar_info_label.setText("\n".join(parts))
 
     # --------------- Event Filter for Mouse Clicks ---------------
 
@@ -373,6 +603,7 @@ class MainWindow(QMainWindow):
         if self.recording_data:
             self.mode = "REPLAY_READY"
             self._compute_measurements()
+            self._cache_positions_for_ar()
         else:
             self.mode = "IDLE"
         self._adding_manual_point = False
@@ -426,10 +657,27 @@ class MainWindow(QMainWindow):
         if self.mode == "RECORDING":
             self.mode = "REPLAY_READY"
             self._compute_measurements()
+            self._cache_positions_for_ar()
             self._adding_manual_point = False
             self.btn_add_point.setChecked(False)
             self.video_label.setCursor(Qt.ArrowCursor)
             self._set_button_states()
+
+    def _cache_positions_for_ar(self):
+        """Build interpolated+smoothed positions array for action recognition."""
+        from src.tracker import Tracker
+        poses = [d[2] for d in self.recording_data]  # landmarks only
+        T = len(poses)
+        positions = np.full((T, 33, 2), np.nan, dtype=np.float64)
+        for i, pose in enumerate(poses):
+            if pose is not None:
+                for ki in range(min(33, len(pose))):
+                    positions[i, ki, 0] = pose[ki][0]
+                    positions[i, ki, 1] = pose[ki][1]
+        tracker = Tracker()
+        tracker.add_frames(poses)
+        positions = tracker.interpolate()
+        self._positions_smooth = tracker.smooth(positions, window=5)
 
     def _on_error(self, message: str):
         QMessageBox.critical(self, "Processing Error", message)
@@ -545,6 +793,10 @@ class MainWindow(QMainWindow):
         # Draw measurement overlay
         vel, dist, elapsed = self._calc_measurements(frame_idx)
         canvas = self._draw_measurements(canvas, vel, dist, elapsed)
+
+        # Draw action recognition labels
+        if self._action_matches:
+            canvas = self._draw_action_labels(canvas, frame_idx)
 
         self._display_replay_frame(canvas)
         self._replay_idx += 1
@@ -685,6 +937,30 @@ class MainWindow(QMainWindow):
 
         return canvas
 
+    def _draw_action_labels(self, canvas: np.ndarray, frame_idx: int) -> np.ndarray:
+        """Overlay action name banner on canvas when frame_idx falls within a match."""
+        if not self._action_matches:
+            return canvas
+        h, w = canvas.shape[:2]
+        for m in self._action_matches:
+            if m.start_frame <= frame_idx <= m.end_frame:
+                overlay = canvas.copy()
+                banner_h = 60
+                cv2.rectangle(overlay, (0, 0), (w, banner_h), (0, 100, 0), -1)
+                cv2.addWeighted(overlay, 0.5, canvas, 0.5, 0, canvas)
+                text = f"{m.action_name}  ({m.confidence:.0%})"
+                font_scale = 1.2
+                thickness = 3
+                (tw, th), _ = cv2.getTextSize(
+                    text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+                )
+                tx = (w - tw) // 2
+                ty = (banner_h + th) // 2
+                cv2.putText(canvas, text, (tx, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                            (255, 255, 255), thickness, cv2.LINE_AA)
+        return canvas
+
     def _compute_measurements(self):
         """Pre-compute summary measurements after recording finishes."""
         ball_positions = []
@@ -754,6 +1030,10 @@ class MainWindow(QMainWindow):
 
             vel, dist, elapsed = self._calc_measurements(frame_idx)
             canvas = self._draw_measurements(canvas, vel, dist, elapsed)
+
+            # Draw action labels in saved video
+            if self._action_matches:
+                canvas = self._draw_action_labels(canvas, frame_idx)
 
             writer.write(canvas)
 
