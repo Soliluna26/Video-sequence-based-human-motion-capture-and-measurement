@@ -46,6 +46,24 @@ def compute_angle(
     return float(np.degrees(np.arccos(cos_theta)))
 
 
+def compute_segment_angle(
+    start1: Tuple[float, float],
+    end1: Tuple[float, float],
+    start2: Tuple[float, float],
+    end2: Tuple[float, float],
+) -> float:
+    """Compute the unsigned angle between two directed line segments."""
+    v1 = np.array(end1, dtype=np.float64) - np.array(start1, dtype=np.float64)
+    v2 = np.array(end2, dtype=np.float64) - np.array(start2, dtype=np.float64)
+
+    norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if norm == 0:
+        return 0.0
+
+    cos_theta = np.clip(float(np.dot(v1, v2)) / norm, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
 def compute_angles_from_landmarks(
     landmarks_seq: np.ndarray,
     angle_definitions: dict,
@@ -75,6 +93,32 @@ def compute_angles_from_landmarks(
             if any(np.isnan(pt).any() for pt in [p1, p2, p3]):
                 continue
             angles[t] = compute_angle(p1, p2, p3)
+        result[name] = angles
+    return result
+
+
+def compute_segment_angles_from_landmarks(
+    landmarks_seq: np.ndarray,
+    segment_definitions: dict,
+) -> dict:
+    """Compute time series of angles between two landmark-defined segments.
+
+    segment_definitions maps a name to (start1, end1, start2, end2).
+    """
+    T = landmarks_seq.shape[0]
+    result = {}
+    for name, (i1, i2, i3, i4) in segment_definitions.items():
+        angles = np.full(T, np.nan)
+        for t in range(T):
+            pts = landmarks_seq[t, [i1, i2, i3, i4]]
+            if np.any(np.isnan(pts)):
+                continue
+            angles[t] = compute_segment_angle(
+                tuple(landmarks_seq[t, i1]),
+                tuple(landmarks_seq[t, i2]),
+                tuple(landmarks_seq[t, i3]),
+                tuple(landmarks_seq[t, i4]),
+            )
         result[name] = angles
     return result
 

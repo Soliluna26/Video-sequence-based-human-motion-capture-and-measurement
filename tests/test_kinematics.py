@@ -12,6 +12,8 @@ import pytest
 from src.kinematics import (
     compute_angle,
     compute_angles_from_landmarks,
+    compute_segment_angle,
+    compute_segment_angles_from_landmarks,
     angular_velocity,
     angular_acceleration,
     trajectory_length,
@@ -52,6 +54,18 @@ class TestComputeAngle:
         """Angle at (5,5): p1=(6,5), p2=(5,5), p3=(5,6) -> 90 deg."""
         angle = compute_angle((6, 5), (5, 5), (5, 6))
         assert abs(angle - 90.0) < 1e-6
+
+
+class TestComputeSegmentAngle:
+    """Test angles between two directed line segments."""
+
+    def test_perpendicular_segments(self):
+        angle = compute_segment_angle((0, 0), (1, 0), (0, 0), (0, 1))
+        assert abs(angle - 90.0) < 1e-6
+
+    def test_parallel_segments(self):
+        angle = compute_segment_angle((1, 1), (3, 1), (4, 4), (8, 4))
+        assert abs(angle - 0.0) < 1e-6
 
 
 class TestAngularVelocity:
@@ -162,6 +176,20 @@ class TestComputeAnglesFromLandmarks:
         result = compute_angles_from_landmarks(landmarks, defs)
         assert "left_knee_angle" in result
         assert np.allclose(result["left_knee_angle"], [90.0, 90.0], atol=1e-6)
+
+    def test_thigh_segment_angle(self):
+        """Synthetic thigh segments: left horizontal, right vertical -> 90 deg."""
+        landmarks = np.full((2, 33, 2), np.nan, dtype=np.float64)
+        landmarks[:, 23] = [0, 0]
+        landmarks[:, 25] = [1, 0]
+        landmarks[:, 24] = [2, 0]
+        landmarks[:, 26] = [2, 1]
+
+        defs = {"thigh_segments_angle": (23, 25, 24, 26)}
+        result = compute_segment_angles_from_landmarks(landmarks, defs)
+
+        assert "thigh_segments_angle" in result
+        assert np.allclose(result["thigh_segments_angle"], [90.0, 90.0], atol=1e-6)
 
 
 class TestSmoothAngles:

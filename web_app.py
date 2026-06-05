@@ -34,6 +34,7 @@ from src.action_recognizer import (
     recognize_rule_based_actions,
     ANGLE_KEYS,
 )
+from src.kinematics import angular_velocity, compute_segment_angles_from_landmarks
 import yaml
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ GREEN = (0, 255, 0)
 DEFAULT_MAX_FRAMES = 300
 MAX_DISPLAY_DIM = 720
 DEFAULT_MM_PER_PIXEL = 2.0
+THIGH_SEGMENT_ANGLE_THRESHOLD_DEG = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +338,33 @@ def calc_ball_metrics(
     return vel_mm_s, dist_mm, elapsed
 
 
+def calc_thigh_segment_metrics(
+    poses: List[Optional[PoseResult]],
+    fps: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate left-thigh vs right-thigh angle, velocity, and active mask."""
+    T = len(poses)
+    positions = np.full((T, 33, 2), np.nan, dtype=np.float64)
+    for fi, pose in enumerate(poses):
+        if pose is None:
+            continue
+        for ki in (23, 24, 25, 26):
+            if ki >= len(pose):
+                continue
+            x, y, conf = pose[ki]
+            if conf >= 0.3:
+                positions[fi, ki, 0] = x
+                positions[fi, ki, 1] = y
+
+    angles = compute_segment_angles_from_landmarks(
+        positions,
+        {"thigh_segments_angle": (23, 25, 24, 26)},
+    )["thigh_segments_angle"]
+    active = angles > THIGH_SEGMENT_ANGLE_THRESHOLD_DEG
+    velocities = np.where(active, angular_velocity(angles, fps), np.nan)
+    return angles, velocities, active
+
+
 def build_manual_trajectories_up_to(
     tracks: Dict[int, List[Tuple[int, float, float]]],
     frame_idx: int,
@@ -591,6 +620,11 @@ def main():
             "Scale (mm/pixel)", 0.1, 100.0, DEFAULT_MM_PER_PIXEL, 0.1,
             help="Pixels to millimeters conversion.",
         )
+        export_thigh_metrics = st.checkbox(
+            "Include thigh angle metrics in CSV",
+            value=True,
+            help="Adds active flag, angle, and angular velocity for segments 23-25 and 24-26.",
+        )
 
         # -- Buttons depend on mode --
         st.divider()
@@ -608,12 +642,16 @@ def main():
                 ss._do_replay = True
                 ss._replay_data = None
                 st.rerun()
-            col_a, col_b = st.columns(2)
+            col_a, col_b, col_c = st.columns(3)
             with col_a:
                 if st.button("📊 CSV Data", use_container_width=True, key="btn_csv"):
                     ss._do_csv = True
                     st.rerun()
             with col_b:
+                if st.button("📈 Angle Velocity CSV", use_container_width=True, key="btn_angle_velocity_csv"):
+                    ss._do_angle_velocity_csv = True
+                    st.rerun()
+            with col_c:
                 if st.button("🔄 Reset All", use_container_width=True, key="btn_reset"):
                     ss._do_reset = True
                     st.rerun()
@@ -957,6 +995,7 @@ def main():
     landmarks = ss.poses[fidx] if fidx < len(ss.poses) else None
     ball_pos = ss.ball_positions[fidx] if fidx < len(ss.ball_positions) else None
     vel, dist, elapsed = calc_ball_metrics(ss.ball_positions, fidx, ss.fps, mm_per_pixel)
+    thigh_angles, thigh_velocities, thigh_active = calc_thigh_segment_metrics(ss.poses, ss.fps)
 
     manual_pos: Dict[int, Tuple[float, float]] = {}
     for pid, history in ss.manual_tracks.items():
@@ -1000,6 +1039,12 @@ def main():
         st.metric("Time", f"{elapsed:.2f} s")
         st.metric("Velocity", f"{vel:.2f} mm/s")
         st.metric("Distance", f"{dist:.2f} mm")
+        if fidx < len(thigh_angles) and not np.isnan(thigh_angles[fidx]):
+            st.metric("Thigh Angle", f"{thigh_angles[fidx]:.2f} deg")
+            if thigh_active[fidx] and not np.isnan(thigh_velocities[fidx]):
+                st.metric("Angular Velocity", f"{thigh_velocities[fidx]:.2f} deg/s")
+            else:
+                st.caption(f"Thigh measurement waits for > {THIGH_SEGMENT_ANGLE_THRESHOLD_DEG:.0f} deg")
         if landmarks is not None:
             nk = sum(1 for lm in landmarks if lm[2] >= 0.3)
             st.caption(f"Keypoints: {nk}/33")
@@ -1051,24 +1096,87 @@ def main():
         import csv as csv_mod
         buf = io.StringIO()
         w = csv_mod.writer(buf)
-        w.writerow(["frame_idx", "time_sec", "point_type", "point_id", "name", "x", "y"])
+        include_thigh = bool(export_thigh_metrics)
+        thigh_angles, thigh_velocities, thigh_active = calc_thigh_segment_metrics(ss.poses, ss.fps)
+        header = ["frame_idx", "time_sec", "point_type", "point_id", "name", "x", "y"]
+        if include_thigh:
+            header.extend([
+                "thigh_measure_active",
+                "thigh_segments_angle_deg",
+                "thigh_segments_angular_velocity_deg_s",
+            ])
+        w.writerow(header)
         for fi in range(T):
             t = fi / ss.fps if ss.fps > 0 else 0.0
+            thigh_cols = []
+            empty_thigh_cols = []
+            if include_thigh:
+                angle = thigh_angles[fi] if fi < len(thigh_angles) else np.nan
+                vel_deg_s = thigh_velocities[fi] if fi < len(thigh_velocities) else np.nan
+                active = bool(thigh_active[fi]) if fi < len(thigh_active) else False
+                thigh_cols = [
+                    int(active),
+                    "" if np.isnan(angle) else f"{angle:.4f}",
+                    "" if np.isnan(vel_deg_s) else f"{vel_deg_s:.4f}",
+                ]
+                empty_thigh_cols = ["", "", ""]
             pose = ss.poses[fi] if fi < len(ss.poses) else None
             if pose is not None:
                 for ki in range(len(pose)):
                     x, y, conf = pose[ki]
                     if conf >= 0.3:
                         name = KEYPOINT_NAMES[ki] if ki < len(KEYPOINT_NAMES) else f"kp_{ki}"
-                        w.writerow([fi, f"{t:.4f}", "human", ki, name, f"{x:.2f}", f"{y:.2f}"])
+                        w.writerow([
+                            fi, f"{t:.4f}", "human", ki,
+                            name, f"{x:.2f}", f"{y:.2f}", *empty_thigh_cols,
+                        ])
             for pid, history in ss.manual_tracks.items():
                 for f_idx, mx, my in history:
                     if f_idx == fi:
-                        w.writerow([fi, f"{t:.4f}", "manual", pid, f"manual_{pid}", f"{mx:.2f}", f"{my:.2f}"])
+                        w.writerow([
+                            fi, f"{t:.4f}", "manual", pid,
+                            f"manual_{pid}", f"{mx:.2f}", f"{my:.2f}", *empty_thigh_cols,
+                        ])
                         break
+            if include_thigh:
+                w.writerow([
+                    fi, f"{t:.4f}", "measurement", "thigh_segments",
+                    "left_hip_left_knee_vs_right_hip_right_knee", "", "", *thigh_cols,
+                ])
         st.download_button(
             "⬇ Download CSV", buf.getvalue(),
             file_name="mocap_tracking.csv", mime="text/csv",
+            use_container_width=True,
+        )
+
+    if getattr(ss, "_do_angle_velocity_csv", False):
+        ss._do_angle_velocity_csv = False
+        import csv as csv_mod
+        buf = io.StringIO()
+        w = csv_mod.writer(buf)
+        thigh_angles, thigh_velocities, thigh_active = calc_thigh_segment_metrics(ss.poses, ss.fps)
+        w.writerow([
+            "frame_idx",
+            "time_sec",
+            "measure_active",
+            "angle_deg",
+            "angular_velocity_deg_s",
+        ])
+        for fi in range(T):
+            t = fi / ss.fps if ss.fps > 0 else 0.0
+            angle = thigh_angles[fi] if fi < len(thigh_angles) else np.nan
+            velocity = thigh_velocities[fi] if fi < len(thigh_velocities) else np.nan
+            active = bool(thigh_active[fi]) if fi < len(thigh_active) else False
+            w.writerow([
+                fi,
+                f"{t:.4f}",
+                int(active),
+                "" if np.isnan(angle) else f"{angle:.4f}",
+                "" if np.isnan(velocity) else f"{velocity:.4f}",
+            ])
+        st.download_button(
+            "⬇ Download Angle Velocity CSV", buf.getvalue(),
+            file_name="angle_velocity.csv", mime="text/csv",
             use_container_width=True,
         )
 

@@ -20,6 +20,8 @@ from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -47,6 +49,7 @@ from src.action_recognizer import (
     extract_angle_features,
     recognize_rule_based_actions,
 )
+from src.kinematics import angular_velocity, compute_segment_angle, compute_segment_angles_from_landmarks
 
 KEYPOINT_NAMES = [
     "nose",
@@ -104,6 +107,12 @@ ORANGE = (0, 165, 255)
 
 # Default scale factor (pixels to mm) — user-configurable
 DEFAULT_MM_PER_PIXEL = 2.0
+THIGH_SEGMENT_ANGLE_THRESHOLD_DEG = 30.0
+MEASURE2_ANGLE_NAMES = [
+    ("thigh_jump_angle", "Thigh Jump Angle"),
+    ("calf_jump_angle", "Calf Jump Angle"),
+    ("foot_angle", "Foot Angle"),
+]
 
 
 class MainWindow(QMainWindow):
@@ -119,7 +128,7 @@ class MainWindow(QMainWindow):
         self.fps: float = 30.0
         self.frame_count: int = 0
         self.mode: str = "IDLE"  # IDLE | RECORDING | REPLAY_READY | REPLAY
-        self.op_mode: str = "capture"  # capture | register | recognize
+        self.op_mode: str = "capture"  # capture | register | recognize | measure | measure2
         self.mm_per_pixel: float = DEFAULT_MM_PER_PIXEL
 
         # Recording data: (frame_idx, frame_bgr, landmarks, ball_pos, manual_positions)
@@ -160,8 +169,16 @@ class MainWindow(QMainWindow):
         )
         self._positions_smooth: Optional[np.ndarray] = None  # cached for registration/recognition
         self._angle_defs: dict = {}
+        self._thigh_angle_deg: Optional[np.ndarray] = None
+        self._thigh_velocity_deg_s: Optional[np.ndarray] = None
+        self._thigh_measure_active: Optional[np.ndarray] = None
+        self._measure2_angles: Dict[str, np.ndarray] = {}
+        self._measure2_velocities: Dict[str, np.ndarray] = {}
 
         self._setup_ui()
+        self._ensure_action_store()
+        self._refresh_template_selector()
+        self._update_ar_info()
         self._set_button_states()
 
     # --------------- UI Setup ---------------
@@ -202,6 +219,20 @@ class MainWindow(QMainWindow):
         self.btn_recognize.setMinimumHeight(52)
         self.btn_recognize.setMinimumWidth(160)
         mode_layout.addWidget(self.btn_recognize)
+
+        self.btn_measure = QPushButton("测量")
+        self.btn_measure.setCheckable(True)
+        self.btn_measure.clicked.connect(lambda: self._on_switch_mode("measure"))
+        self.btn_measure.setMinimumHeight(52)
+        self.btn_measure.setMinimumWidth(160)
+        mode_layout.addWidget(self.btn_measure)
+
+        self.btn_measure2 = QPushButton("测2")
+        self.btn_measure2.setCheckable(True)
+        self.btn_measure2.clicked.connect(lambda: self._on_switch_mode("measure2"))
+        self.btn_measure2.setMinimumHeight(52)
+        self.btn_measure2.setMinimumWidth(160)
+        mode_layout.addWidget(self.btn_measure2)
 
         mode_layout.addStretch()
         main_layout.addLayout(mode_layout)
@@ -256,6 +287,7 @@ class MainWindow(QMainWindow):
         self._capture_btns: List[QWidget] = []
         self._register_btns: List[QWidget] = []
         self._recognize_btns: List[QWidget] = []
+        self._measure_btns: List[QWidget] = []
 
         # Capture-only buttons
         self.btn_save = QPushButton("Save Result")
@@ -334,11 +366,42 @@ class MainWindow(QMainWindow):
         self.btn_export_csv.setMinimumHeight(44)
         sidebar.addWidget(self.btn_export_csv)
 
+        self.btn_export_angle_velocity_csv = QPushButton("Export Angle Velocity CSV")
+        self.btn_export_angle_velocity_csv.clicked.connect(self._on_export_angle_velocity_csv)
+        self.btn_export_angle_velocity_csv.setMinimumHeight(44)
+        sidebar.addWidget(self.btn_export_angle_velocity_csv)
+        self._measure_btns.append(self.btn_export_angle_velocity_csv)
+
+        self.chk_export_thigh_metrics = QCheckBox("Measurement CSV")
+        self.chk_export_thigh_metrics.setChecked(True)
+        self.chk_export_thigh_metrics.setStyleSheet("font-size: 15px; color: #ddd;")
+        sidebar.addWidget(self.chk_export_thigh_metrics)
+        self._measure_btns.append(self.chk_export_thigh_metrics)
+
         self.manual_points_list = QListWidget()
         self.manual_points_list.setMinimumWidth(200)
         sidebar.addWidget(self.manual_points_list, stretch=1)
 
         # Action recognition info area
+        action_title = QLabel("Action Templates")
+        action_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ccc;")
+        sidebar.addWidget(action_title)
+
+        self.template_selector = QComboBox()
+        self.template_selector.setMinimumHeight(36)
+        sidebar.addWidget(self.template_selector)
+
+        self.btn_delete_template = QPushButton("Delete Action")
+        self.btn_delete_template.clicked.connect(self._on_delete_action_template)
+        self.btn_delete_template.setMinimumHeight(40)
+        self.btn_delete_template.setStyleSheet(
+            "QPushButton { background-color: #5a2020; color: #ffb0b0; "
+            "border: 1px solid #833; border-radius: 6px; padding: 8px 12px; }"
+            "QPushButton:hover { background-color: #743030; }"
+            "QPushButton:disabled { background-color: #2a2a2a; color: #666; }"
+        )
+        sidebar.addWidget(self.btn_delete_template)
+
         self.ar_info_label = QLabel("")
         self.ar_info_label.setWordWrap(True)
         self.ar_info_label.setStyleSheet("font-size: 16px; color: #8af; padding: 4px;")
@@ -367,9 +430,9 @@ class MainWindow(QMainWindow):
 
         # Capture mode buttons
         for w in self._capture_btns:
-            w.setVisible(self.op_mode == "capture")
-        self.btn_save.setEnabled(is_replay_ready and self.op_mode == "capture")
-        self.btn_replay.setEnabled(is_replay_ready and self.op_mode == "capture")
+            w.setVisible(self.op_mode in ("capture", "measure", "measure2"))
+        self.btn_save.setEnabled(is_replay_ready and self.op_mode in ("capture", "measure", "measure2"))
+        self.btn_replay.setEnabled(is_replay_ready and self.op_mode in ("capture", "measure", "measure2"))
 
         # Register mode buttons
         for w in self._register_btns:
@@ -389,10 +452,26 @@ class MainWindow(QMainWindow):
             self.op_mode == "recognize" and is_replay_ready
         )
 
+        # Measure mode widgets
+        for w in self._measure_btns:
+            w.setVisible(self.op_mode in ("measure", "measure2"))
+        self.btn_export_angle_velocity_csv.setEnabled(
+            self.op_mode in ("measure", "measure2") and is_replay_ready
+        )
+        self.chk_export_thigh_metrics.setEnabled(
+            self.op_mode in ("measure", "measure2") and is_replay_ready
+        )
+
+        has_templates = self.template_selector.count() > 0
+        self.template_selector.setEnabled(has_templates and not is_recording)
+        self.btn_delete_template.setEnabled(has_templates and not is_recording)
+
         # Mode toggle buttons
         self.btn_capture.setChecked(self.op_mode == "capture")
         self.btn_register.setChecked(self.op_mode == "register")
         self.btn_recognize.setChecked(self.op_mode == "recognize")
+        self.btn_measure.setChecked(self.op_mode == "measure")
+        self.btn_measure2.setChecked(self.op_mode == "measure2")
 
     # --------------- Mode Switching ---------------
 
@@ -401,6 +480,10 @@ class MainWindow(QMainWindow):
         if self.mode == "RECORDING":
             return  # can't switch while recording
         self.op_mode = op_mode
+        if self.op_mode == "measure" and self.mode == "REPLAY_READY" and self.recording_data:
+            self._cache_thigh_measurements()
+        if self.op_mode == "measure2" and self.mode == "REPLAY_READY" and self.recording_data:
+            self._cache_measure2_measurements()
         self._set_button_states()
 
     # --------------- Action Recognition ---------------
@@ -416,6 +499,31 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         return self._action_store
+
+    def _refresh_template_selector(self):
+        """Refresh the registered-action selector in the sidebar."""
+        if not hasattr(self, "template_selector"):
+            return
+
+        current_id = self.template_selector.currentData()
+        self.template_selector.blockSignals(True)
+        self.template_selector.clear()
+
+        store = self._action_store
+        if store:
+            for tmpl in store.templates:
+                self.template_selector.addItem(
+                    f"{tmpl.name} ({tmpl.template_id})",
+                    tmpl.template_id,
+                )
+
+        if current_id:
+            idx = self.template_selector.findData(current_id)
+            if idx >= 0:
+                self.template_selector.setCurrentIndex(idx)
+
+        self.template_selector.blockSignals(False)
+        self._set_button_states()
 
     def _on_register_action(self):
         """Register the processed recording as a new action template."""
@@ -435,7 +543,43 @@ class MainWindow(QMainWindow):
             self, "Registered",
             f"Action '{name}' registered!\nTotal templates: {len(store)}"
         )
+        self._refresh_template_selector()
         self._update_ar_info()
+
+    def _on_delete_action_template(self):
+        """Delete the selected registered action template."""
+        store = self._ensure_action_store()
+        template_id = self.template_selector.currentData()
+        if not template_id:
+            QMessageBox.information(self, "Delete Action", "No registered action selected.")
+            return
+
+        tmpl = store.get(template_id)
+        if tmpl is None:
+            QMessageBox.warning(self, "Delete Action", "The selected action no longer exists.")
+            self._refresh_template_selector()
+            self._update_ar_info()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete Action",
+            f"Delete registered action '{tmpl.name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if store.remove(template_id):
+            store.save(self._templates_path)
+            self._action_matches = [
+                m for m in self._action_matches
+                if getattr(m, "action_name", None) != tmpl.name
+            ]
+            self._refresh_template_selector()
+            self._update_ar_info()
+            QMessageBox.information(self, "Delete Action", f"Action '{tmpl.name}' deleted.")
 
     def _on_recognize_actions(self):
         """Run action recognition on the processed recording."""
@@ -655,6 +799,10 @@ class MainWindow(QMainWindow):
             self.mode = "REPLAY_READY"
             self._compute_measurements()
             self._cache_positions_for_ar()
+            if self.op_mode == "measure":
+                self._cache_thigh_measurements()
+            elif self.op_mode == "measure2":
+                self._cache_measure2_measurements()
         else:
             self.mode = "IDLE"
         self._adding_manual_point = False
@@ -709,6 +857,10 @@ class MainWindow(QMainWindow):
             self.mode = "REPLAY_READY"
             self._compute_measurements()
             self._cache_positions_for_ar()
+            if self.op_mode == "measure":
+                self._cache_thigh_measurements()
+            elif self.op_mode == "measure2":
+                self._cache_measure2_measurements()
             self._adding_manual_point = False
             self.btn_add_point.setChecked(False)
             self.video_label.setCursor(Qt.ArrowCursor)
@@ -758,6 +910,21 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._export_tracking_csv(path)
+
+    def _on_export_angle_velocity_csv(self):
+        """Export only thigh segment angle and angular velocity to CSV."""
+        if not self.recording_data:
+            return
+        if self.op_mode not in ("measure", "measure2"):
+            QMessageBox.information(self, "Measure", "Please switch to Measure mode first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Angle Velocity CSV", "output/angle_velocity.csv",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+        self._export_angle_velocity_csv(path)
 
     # --------------- Display ---------------
 
@@ -844,6 +1011,11 @@ class MainWindow(QMainWindow):
         # Draw action recognition labels
         if self._action_matches:
             canvas = self._draw_action_labels(canvas, frame_idx)
+
+        if self.op_mode == "measure":
+            canvas = self._draw_thigh_measurement(canvas, frame_idx)
+        elif self.op_mode == "measure2":
+            canvas = self._draw_measure2_measurement(canvas, frame_idx)
 
         self._display_replay_frame(canvas)
         self._replay_idx += 1
@@ -986,6 +1158,169 @@ class MainWindow(QMainWindow):
                             (255, 255, 255), thickness, cv2.LINE_AA)
         return canvas
 
+    def _draw_thigh_measurement(self, canvas: np.ndarray, frame_idx: int) -> np.ndarray:
+        """Overlay thigh segment angle and angular velocity for the current frame."""
+        if self.op_mode != "measure":
+            return canvas
+        if (
+            self._thigh_angle_deg is None or
+            self._thigh_velocity_deg_s is None or
+            self._thigh_measure_active is None or
+            frame_idx >= len(self._thigh_angle_deg)
+        ):
+            return canvas
+
+        angle = self._thigh_angle_deg[frame_idx]
+        if np.isnan(angle):
+            return canvas
+
+        active = bool(self._thigh_measure_active[frame_idx])
+        h, w = canvas.shape[:2]
+        overlay = canvas.copy()
+        panel_h = 78
+        cv2.rectangle(overlay, (0, h - panel_h), (w, h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0, canvas)
+
+        if active:
+            vel = self._thigh_velocity_deg_s[frame_idx]
+            vel_text = "n/a" if np.isnan(vel) else f"{vel:.2f} deg/s"
+            text = f"Thigh segments angle: {angle:.2f} deg | Angular velocity: {vel_text}"
+            color = (120, 255, 120)
+        else:
+            text = f"Thigh segments angle: {angle:.2f} deg | Waiting > {THIGH_SEGMENT_ANGLE_THRESHOLD_DEG:.0f} deg"
+            color = (180, 180, 180)
+
+        cv2.putText(
+            canvas, text, (18, h - 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2, cv2.LINE_AA,
+        )
+        return canvas
+
+    def _cache_thigh_measurements(self):
+        """Cache angle/velocity between left and right thigh segments."""
+        T = len(self.recording_data)
+        positions = np.full((T, 33, 2), np.nan, dtype=np.float64)
+        for i, (_, _, landmarks, _, _) in enumerate(self.recording_data):
+            if landmarks is None:
+                continue
+            for ki in (23, 24, 25, 26):
+                if ki >= len(landmarks):
+                    continue
+                x, y, conf = landmarks[ki]
+                if conf >= 0.3:
+                    positions[i, ki, 0] = x
+                    positions[i, ki, 1] = y
+
+        angles = compute_segment_angles_from_landmarks(
+            positions,
+            {"thigh_segments_angle": (23, 25, 24, 26)},
+        )["thigh_segments_angle"]
+        active = angles > THIGH_SEGMENT_ANGLE_THRESHOLD_DEG
+        velocities = angular_velocity(angles, self.fps)
+        velocities = np.where(active, velocities, np.nan)
+
+        self._thigh_angle_deg = angles
+        self._thigh_velocity_deg_s = velocities
+        self._thigh_measure_active = active
+
+    @staticmethod
+    def _segment_vertical_angle(start: np.ndarray, end: np.ndarray) -> float:
+        """Angle between a segment and the image vertical line, folded to 0-90 deg."""
+        angle = compute_segment_angle(tuple(start), tuple(end), (0.0, 0.0), (0.0, 1.0))
+        return min(angle, 180.0 - angle)
+
+    @staticmethod
+    def _nanmean_pair(left: float, right: float) -> float:
+        values = np.array([left, right], dtype=np.float64)
+        if np.all(np.isnan(values)):
+            return np.nan
+        return float(np.nanmean(values))
+
+    def _cache_measure2_measurements(self):
+        """Cache jump-related thigh, calf, and foot angle measurements."""
+        T = len(self.recording_data)
+        angles = {key: np.full(T, np.nan, dtype=np.float64) for key, _ in MEASURE2_ANGLE_NAMES}
+
+        for i, (_, _, landmarks, _, _) in enumerate(self.recording_data):
+            if landmarks is None:
+                continue
+
+            points: Dict[int, np.ndarray] = {}
+            for ki in (23, 24, 25, 26, 27, 28, 31, 32):
+                if ki >= len(landmarks):
+                    continue
+                x, y, conf = landmarks[ki]
+                if conf >= 0.3:
+                    points[ki] = np.array([x, y], dtype=np.float64)
+
+            left_thigh = (
+                self._segment_vertical_angle(points[23], points[25])
+                if 23 in points and 25 in points else np.nan
+            )
+            right_thigh = (
+                self._segment_vertical_angle(points[24], points[26])
+                if 24 in points and 26 in points else np.nan
+            )
+            angles["thigh_jump_angle"][i] = self._nanmean_pair(left_thigh, right_thigh)
+
+            left_calf = (
+                self._segment_vertical_angle(points[25], points[27])
+                if 25 in points and 27 in points else np.nan
+            )
+            right_calf = (
+                self._segment_vertical_angle(points[26], points[28])
+                if 26 in points and 28 in points else np.nan
+            )
+            angles["calf_jump_angle"][i] = self._nanmean_pair(left_calf, right_calf)
+
+            left_foot = (
+                compute_segment_angle(tuple(points[27]), tuple(points[31]), tuple(points[25]), tuple(points[27]))
+                if 25 in points and 27 in points and 31 in points else np.nan
+            )
+            right_foot = (
+                compute_segment_angle(tuple(points[28]), tuple(points[32]), tuple(points[26]), tuple(points[28]))
+                if 26 in points and 28 in points and 32 in points else np.nan
+            )
+            angles["foot_angle"][i] = self._nanmean_pair(left_foot, right_foot)
+
+        self._measure2_angles = angles
+        self._measure2_velocities = {
+            key: angular_velocity(seq, self.fps)
+            for key, seq in angles.items()
+        }
+
+    def _draw_measure2_measurement(self, canvas: np.ndarray, frame_idx: int) -> np.ndarray:
+        """Overlay Measure2 angles and angular velocities for the current frame."""
+        if self.op_mode != "measure2":
+            return canvas
+        if not self._measure2_angles:
+            return canvas
+
+        h, w = canvas.shape[:2]
+        overlay = canvas.copy()
+        panel_h = 126
+        cv2.rectangle(overlay, (0, h - panel_h), (w, h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.58, canvas, 0.42, 0, canvas)
+
+        y = h - 92
+        for key, label in MEASURE2_ANGLE_NAMES:
+            values = self._measure2_angles.get(key)
+            velocities = self._measure2_velocities.get(key)
+            if values is None or frame_idx >= len(values) or np.isnan(values[frame_idx]):
+                text = f"{label}: n/a"
+            else:
+                vel = np.nan
+                if velocities is not None and frame_idx < len(velocities):
+                    vel = velocities[frame_idx]
+                vel_text = "n/a" if np.isnan(vel) else f"{vel:.2f} deg/s"
+                text = f"{label}: {values[frame_idx]:.2f} deg | {vel_text}"
+            cv2.putText(
+                canvas, text, (18, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.68, (120, 255, 120), 2, cv2.LINE_AA,
+            )
+            y += 34
+        return canvas
+
     def _compute_measurements(self):
         """Pre-compute summary measurements after recording finishes."""
         ball_positions = []
@@ -1057,12 +1392,90 @@ class MainWindow(QMainWindow):
             if self._action_matches:
                 canvas = self._draw_action_labels(canvas, frame_idx)
 
+            if self.op_mode == "measure":
+                canvas = self._draw_thigh_measurement(canvas, frame_idx)
+            elif self.op_mode == "measure2":
+                canvas = self._draw_measure2_measurement(canvas, frame_idx)
+
             writer.write(canvas)
 
         writer.release()
         QMessageBox.information(self, "Saved", f"Replay video saved to:\n{output_path}")
 
     # --------------- Export ---------------
+
+    def _export_angle_velocity_csv(self, output_path: str):
+        """Export only angle and angular velocity measurements."""
+        if not self.recording_data:
+            return
+        if self.op_mode not in ("measure", "measure2"):
+            return
+
+        if self.op_mode == "measure2":
+            if not self._measure2_angles:
+                self._cache_measure2_measurements()
+            with open(output_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "frame_idx",
+                    "time_sec",
+                    "thigh_jump_angle_deg",
+                    "thigh_jump_angular_velocity_deg_s",
+                    "calf_jump_angle_deg",
+                    "calf_jump_angular_velocity_deg_s",
+                    "foot_angle_deg",
+                    "foot_angular_velocity_deg_s",
+                ])
+                for frame_idx, _, _, _, _ in self.recording_data:
+                    time_sec = frame_idx / self.fps if self.fps > 0 else 0.0
+                    row = [frame_idx, f"{time_sec:.4f}"]
+                    for key, _ in MEASURE2_ANGLE_NAMES:
+                        angle_seq = self._measure2_angles.get(key)
+                        vel_seq = self._measure2_velocities.get(key)
+                        angle = angle_seq[frame_idx] if angle_seq is not None and frame_idx < len(angle_seq) else np.nan
+                        velocity = vel_seq[frame_idx] if vel_seq is not None and frame_idx < len(vel_seq) else np.nan
+                        row.extend([
+                            "" if np.isnan(angle) else f"{angle:.4f}",
+                            "" if np.isnan(velocity) else f"{velocity:.4f}",
+                        ])
+                    writer.writerow(row)
+            QMessageBox.information(self, "Exported", f"Angle velocity data saved to:\n{output_path}")
+            return
+
+        if self._thigh_angle_deg is None:
+            self._cache_thigh_measurements()
+
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "frame_idx",
+                "time_sec",
+                "measure_active",
+                "angle_deg",
+                "angular_velocity_deg_s",
+            ])
+
+            for frame_idx, _, _, _, _ in self.recording_data:
+                time_sec = frame_idx / self.fps if self.fps > 0 else 0.0
+                angle = np.nan
+                velocity = np.nan
+                active = False
+                if self._thigh_angle_deg is not None and frame_idx < len(self._thigh_angle_deg):
+                    angle = self._thigh_angle_deg[frame_idx]
+                if self._thigh_velocity_deg_s is not None and frame_idx < len(self._thigh_velocity_deg_s):
+                    velocity = self._thigh_velocity_deg_s[frame_idx]
+                if self._thigh_measure_active is not None and frame_idx < len(self._thigh_measure_active):
+                    active = bool(self._thigh_measure_active[frame_idx])
+
+                writer.writerow([
+                    frame_idx,
+                    f"{time_sec:.4f}",
+                    int(active),
+                    "" if np.isnan(angle) else f"{angle:.4f}",
+                    "" if np.isnan(velocity) else f"{velocity:.4f}",
+                ])
+
+        QMessageBox.information(self, "Exported", f"Angle velocity data saved to:\n{output_path}")
 
     def _export_tracking_csv(self, output_path: str):
         """Export all tracking data (human keypoints + manual points) to CSV.
@@ -1074,10 +1487,48 @@ class MainWindow(QMainWindow):
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_idx", "time_sec", "point_type", "point_id", "name", "x", "y"])
+            include_thigh = self.op_mode == "measure" and self.chk_export_thigh_metrics.isChecked()
+            include_measure2 = self.op_mode == "measure2" and self.chk_export_thigh_metrics.isChecked()
+            header = ["frame_idx", "time_sec", "point_type", "point_id", "name", "x", "y"]
+            if include_thigh:
+                header.extend([
+                    "thigh_measure_active",
+                    "thigh_segments_angle_deg",
+                    "thigh_segments_angular_velocity_deg_s",
+                ])
+            elif include_measure2:
+                header.extend([
+                    "measure2_angle_deg",
+                    "measure2_angular_velocity_deg_s",
+                ])
+            writer.writerow(header)
 
             for frame_idx, frame_bgr, landmarks, ball_pos, manual_positions in self.recording_data:
                 time_sec = frame_idx / self.fps
+                thigh_cols = []
+                empty_thigh_cols = []
+                if include_thigh:
+                    if self._thigh_angle_deg is None:
+                        self._cache_thigh_measurements()
+                    angle = np.nan
+                    vel = np.nan
+                    active = False
+                    if self._thigh_angle_deg is not None and frame_idx < len(self._thigh_angle_deg):
+                        angle = self._thigh_angle_deg[frame_idx]
+                    if self._thigh_velocity_deg_s is not None and frame_idx < len(self._thigh_velocity_deg_s):
+                        vel = self._thigh_velocity_deg_s[frame_idx]
+                    if self._thigh_measure_active is not None and frame_idx < len(self._thigh_measure_active):
+                        active = bool(self._thigh_measure_active[frame_idx])
+                    thigh_cols = [
+                        int(active),
+                        "" if np.isnan(angle) else f"{angle:.4f}",
+                        "" if np.isnan(vel) else f"{vel:.4f}",
+                    ]
+                    empty_thigh_cols = ["", "", ""]
+                elif include_measure2:
+                    if not self._measure2_angles:
+                        self._cache_measure2_measurements()
+                    empty_thigh_cols = ["", ""]
 
                 # Human keypoints
                 if landmarks is not None:
@@ -1085,11 +1536,34 @@ class MainWindow(QMainWindow):
                         x, y, conf = landmarks[kp_idx]
                         if conf >= 0.3:
                             name = KEYPOINT_NAMES[kp_idx] if kp_idx < len(KEYPOINT_NAMES) else f"kp_{kp_idx}"
-                            writer.writerow([frame_idx, f"{time_sec:.4f}", "human", kp_idx, name, f"{x:.2f}", f"{y:.2f}"])
+                            writer.writerow([
+                                frame_idx, f"{time_sec:.4f}", "human", kp_idx,
+                                name, f"{x:.2f}", f"{y:.2f}", *empty_thigh_cols,
+                            ])
 
                 # Manual points
                 for pid, pos in manual_positions.items():
-                    writer.writerow([frame_idx, f"{time_sec:.4f}", "manual", pid, f"manual_{pid}", f"{pos[0]:.2f}", f"{pos[1]:.2f}"])
+                    writer.writerow([
+                        frame_idx, f"{time_sec:.4f}", "manual", pid,
+                        f"manual_{pid}", f"{pos[0]:.2f}", f"{pos[1]:.2f}", *empty_thigh_cols,
+                    ])
+
+                if include_thigh:
+                    writer.writerow([
+                        frame_idx, f"{time_sec:.4f}", "measurement", "thigh_segments",
+                        "left_hip_left_knee_vs_right_hip_right_knee", "", "", *thigh_cols,
+                    ])
+                elif include_measure2:
+                    for key, label in MEASURE2_ANGLE_NAMES:
+                        angle_seq = self._measure2_angles.get(key)
+                        vel_seq = self._measure2_velocities.get(key)
+                        angle = angle_seq[frame_idx] if angle_seq is not None and frame_idx < len(angle_seq) else np.nan
+                        velocity = vel_seq[frame_idx] if vel_seq is not None and frame_idx < len(vel_seq) else np.nan
+                        writer.writerow([
+                            frame_idx, f"{time_sec:.4f}", "measurement", key, label, "", "",
+                            "" if np.isnan(angle) else f"{angle:.4f}",
+                            "" if np.isnan(velocity) else f"{velocity:.4f}",
+                        ])
 
         QMessageBox.information(self, "Exported", f"Tracking data saved to:\n{output_path}")
 
