@@ -7,13 +7,22 @@ Uses the MediaPipe Tasks PoseLandmarker API (0.10.x).
 """
 
 import os
+import sys
 import urllib.request
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
-import mediapipe as mp
 import numpy as np
+
+if sys.version_info >= (3, 14):
+    raise RuntimeError(
+        "MediaPipe Pose is not compatible with this project's Python 3.14 "
+        "environment. Please recreate the virtual environment with Python "
+        "3.11 or 3.12, then reinstall requirements."
+    )
+
+import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core import base_options as mp_base_options
 

@@ -4,13 +4,12 @@ Emits results via PyQt signals.
 """
 
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from src.pose_estimator import PoseEstimator, PoseResult
 from src.ball_tracker import BallTracker
 
 # Single frame result emitted by the worker:
@@ -18,7 +17,7 @@ from src.ball_tracker import BallTracker
 FrameData = Tuple[
     int,
     np.ndarray,
-    Optional[PoseResult],
+    Optional[Any],
     Optional[Tuple[float, float]],
     Dict[int, Tuple[float, float]],
 ]
@@ -68,6 +67,8 @@ class VideoWorker(QThread):
             return
 
         try:
+            from src.pose_estimator import PoseEstimator
+
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             limit = min(total, self.max_frames) if self.max_frames else total

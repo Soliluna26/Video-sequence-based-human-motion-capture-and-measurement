@@ -31,6 +31,7 @@ from src.action_recognizer import (
     ActionRecognizer,
     TemplateStore,
     extract_angle_features,
+    recognize_rule_based_actions,
     ANGLE_KEYS,
 )
 import yaml
@@ -172,7 +173,6 @@ def render_overlay_frame(
     vel_mm_s: float = 0.0,
     dist_mm: float = 0.0,
     elapsed_s: float = 0.0,
-    show_measurements: bool = True,
 ) -> np.ndarray:
     """Render a frame with skeleton, ball, manual points, and trajectories."""
     canvas = frame_bgr.copy()
@@ -204,18 +204,6 @@ def render_overlay_frame(
         bx, by = int(np.clip(ball_pos[0], 0, w - 1)), int(np.clip(ball_pos[1], 0, h - 1))
         cv2.circle(canvas, (bx, by), 10, GREEN, -1)
         cv2.circle(canvas, (bx, by), 14, GREEN, 2)
-
-    if show_measurements:
-        lines = [
-            f"Velocity: {vel_mm_s:.2f} mm/s",
-            f"Distance: {dist_mm:.2f} mm",
-            f"Time: {elapsed_s:.2f} s",
-        ]
-        y0 = 30
-        for i, text in enumerate(lines):
-            y = y0 + i * 28
-            cv2.putText(canvas, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65, WHITE, 2, cv2.LINE_AA)
 
     return canvas
 
@@ -268,18 +256,6 @@ def render_replay_frame(
         for px, py in pts:
             cx, cy = int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1))
             cv2.circle(canvas, (cx, cy), 3, BLUE, -1)
-
-    # Measurements
-    lines = [
-        f"Velocity: {vel_mm_s:.2f} mm/s",
-        f"Distance: {dist_mm:.2f} mm",
-        f"Time: {elapsed_s:.2f} s",
-    ]
-    y0 = 30
-    for i, text in enumerate(lines):
-        y = y0 + i * 28
-        cv2.putText(canvas, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65, WHITE, 2, cv2.LINE_AA)
 
     return canvas
 
@@ -877,19 +853,23 @@ def main():
 
         if getattr(ss, "_do_recognize", False):
             ss._do_recognize = False
+            ss.action_matches = recognize_rule_based_actions(positions_smooth, ss.fps)
             if len(ss.action_store) > 0 and angle_defs:
                 feat = extract_angle_features(positions_smooth, angle_defs, window=5)
                 recognizer = ActionRecognizer(
                     ss.action_store, sensitivity=_s("ar_sensitivity", 2.0),
                 )
-                ss.action_matches = recognizer.recognize(feat, ss.fps)
+                ss.action_matches.extend(recognizer.recognize(feat, ss.fps))
+                ss.action_matches.sort(key=lambda m: (m.start_frame, m.action_name))
                 if ss.action_matches:
                     st.toast(f"Detected {len(ss.action_matches)} action(s)!", icon="🔍")
                 else:
                     st.toast("No actions detected.", icon="ℹ️")
             else:
-                ss.action_matches = []
-                st.toast("No templates loaded. Register one first.", icon="⚠️")
+                if ss.action_matches:
+                    st.toast(f"Detected {len(ss.action_matches)} action(s)!", icon="🔍")
+                else:
+                    st.toast("No actions detected.")
             st.rerun()
 
     # --- Replay generation ---

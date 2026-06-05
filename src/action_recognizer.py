@@ -37,6 +37,17 @@ ANGLE_KEYS: List[str] = [
     "right_ankle_angle",
 ]
 
+RULE_BASED_ACTIONS: Dict[str, dict] = {
+    "V_bottom": {"type": "symmetric_angle", "range": (30.0, 60.0)},
+    "T_big": {"type": "symmetric_angle", "range": (80.0, 100.0)},
+    "V_up": {"type": "symmetric_angle", "range": (110.0, 165.0)},
+    "H_up": {"type": "symmetric_angle", "range": (160.0, 180.0)},
+    "K_r": {"type": "k", "side": "left", "arm_range": (65.0, 110.0)},
+    "K_l": {"type": "k", "side": "right", "arm_range": (65.0, 110.0)},
+}
+
+RULE_KEYPOINTS = (11, 12, 13, 14, 15, 16, 23, 24)
+
 # ---------------------------------------------------------------------------
 # DTW core
 # ---------------------------------------------------------------------------
@@ -506,8 +517,270 @@ class ActionRecognizer:
 
 
 # ---------------------------------------------------------------------------
+# Rule-based static pose recognition
+# ---------------------------------------------------------------------------
+
+def recognize_rule_based_actions(
+    landmarks_seq: np.ndarray,
+    fps: float = 30.0,
+    min_duration_sec: float = 0.20,
+) -> List[ActionMatch]:
+    """Detect predefined static arm poses from landmark geometry.
+
+    The rules use MediaPipe pose landmarks:
+    - 11/13 and 11/23 for the left shoulder angle
+    - 12/14 and 12/24 for the right shoulder angle
+    - 11/13 and 12/14 upper-arm angle plus shoulder-wrist side tests for K poses
+
+    Parameters
+    ----------
+    landmarks_seq : np.ndarray, shape (T, 33, 2)
+        Interpolated/smoothed landmark positions.
+    fps : float
+    min_duration_sec : float
+        Minimum length of a detected pose segment.
+
+    Returns
+    -------
+    matches : List[ActionMatch]
+        One match per continuous pose segment.
+    """
+    if landmarks_seq.ndim != 3 or landmarks_seq.shape[1] < 25:
+        return []
+
+    features = _rule_pose_features(landmarks_seq)
+    valid = features["valid"]
+    if not valid.any():
+        return []
+
+    min_frames = max(1, int(round(min_duration_sec * max(fps, 1.0))))
+    matches: List[ActionMatch] = []
+
+    for name, spec in RULE_BASED_ACTIONS.items():
+        if spec["type"] == "symmetric_angle":
+            lo, hi = spec["range"]
+            mask = (
+                valid
+                & _in_range(features["left_shoulder"], lo, hi)
+                & _in_range(features["right_shoulder"], lo, hi)
+            )
+            score = _symmetric_angle_score(
+                features["left_shoulder"],
+                features["right_shoulder"],
+                lo,
+                hi,
+            )
+        else:
+            lo, hi = spec["arm_range"]
+            side = spec["side"]
+            if side == "left":
+                side_mask = (
+                    features["left_arm_on_left"]
+                    & features["right_arm_on_left"]
+                    & features["arms_on_body_left"]
+                )
+            else:
+                side_mask = (
+                    features["left_arm_on_right"]
+                    & features["right_arm_on_right"]
+                    & features["arms_on_body_right"]
+                )
+            mask = valid & side_mask & _in_range(features["arm_angle"], lo, hi)
+            score = _k_score(
+                features["arm_angle"],
+                features["left_arm_straightness"],
+                features["right_arm_straightness"],
+            )
+
+        for start, end in _contiguous_true_segments(mask, min_frames):
+            segment_score = score[start:end]
+            segment_score = segment_score[~np.isnan(segment_score)]
+            if len(segment_score) == 0:
+                confidence = 0.5
+            else:
+                confidence = float(np.clip(np.mean(segment_score), 0.0, 1.0))
+            matches.append(ActionMatch(
+                action_name=name,
+                template_id=f"rule:{name}",
+                start_frame=start,
+                end_frame=end - 1,
+                start_sec=start / fps,
+                end_sec=(end - 1) / fps,
+                confidence=round(confidence, 4),
+            ))
+
+    matches.sort(key=lambda r: (r.start_frame, r.action_name))
+    return matches
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _rule_pose_features(landmarks_seq: np.ndarray) -> Dict[str, np.ndarray]:
+    """Compute per-frame angles and side tests for rule-based poses."""
+    T = landmarks_seq.shape[0]
+    out = {
+        "left_shoulder": np.full(T, np.nan, dtype=np.float64),
+        "right_shoulder": np.full(T, np.nan, dtype=np.float64),
+        "arm_angle": np.full(T, np.nan, dtype=np.float64),
+        "left_arm_straightness": np.full(T, np.nan, dtype=np.float64),
+        "right_arm_straightness": np.full(T, np.nan, dtype=np.float64),
+        "valid": np.zeros(T, dtype=bool),
+        "left_arm_on_left": np.zeros(T, dtype=bool),
+        "right_arm_on_left": np.zeros(T, dtype=bool),
+        "left_arm_on_right": np.zeros(T, dtype=bool),
+        "right_arm_on_right": np.zeros(T, dtype=bool),
+        "arms_on_body_left": np.zeros(T, dtype=bool),
+        "arms_on_body_right": np.zeros(T, dtype=bool),
+    }
+
+    for t in range(T):
+        frame = landmarks_seq[t]
+        if np.isnan(frame[list(RULE_KEYPOINTS), :]).any():
+            continue
+
+        left_shoulder = frame[11]
+        right_shoulder = frame[12]
+        left_elbow = frame[13]
+        right_elbow = frame[14]
+        left_wrist = frame[15]
+        right_wrist = frame[16]
+        left_hip = frame[23]
+        right_hip = frame[24]
+
+        out["left_shoulder"][t] = _angle_at(left_elbow, left_shoulder, left_hip)
+        out["right_shoulder"][t] = _angle_at(right_elbow, right_shoulder, right_hip)
+        out["arm_angle"][t] = abs(_signed_angle_between(
+            left_elbow - left_shoulder,
+            right_elbow - right_shoulder,
+        ))
+        out["left_arm_straightness"][t] = _straightness_angle(
+            left_shoulder, left_elbow, left_wrist
+        )
+        out["right_arm_straightness"][t] = _straightness_angle(
+            right_shoulder, right_elbow, right_wrist
+        )
+
+        right_torso_len = float(np.linalg.norm(right_hip - right_shoulder))
+        left_torso_len = float(np.linalg.norm(left_hip - left_shoulder))
+        if right_torso_len < 1e-9 or left_torso_len < 1e-9:
+            continue
+
+        right_torso_tol = right_torso_len * 0.08
+        left_torso_tol = left_torso_len * 0.08
+        left_arm_side_right_torso = _segment_side_of_line(
+            left_shoulder, left_wrist, right_shoulder, right_hip
+        )
+        right_arm_side_right_torso = _segment_side_of_line(
+            right_shoulder, right_wrist, right_shoulder, right_hip
+        )
+        left_arm_side_left_torso = _segment_side_of_line(
+            left_shoulder, left_wrist, left_shoulder, left_hip
+        )
+        right_arm_side_left_torso = _segment_side_of_line(
+            right_shoulder, right_wrist, left_shoulder, left_hip
+        )
+
+        out["left_arm_on_left"][t] = left_arm_side_right_torso >= -right_torso_tol
+        out["right_arm_on_left"][t] = right_arm_side_right_torso >= -right_torso_tol
+        out["left_arm_on_right"][t] = left_arm_side_left_torso <= left_torso_tol
+        out["right_arm_on_right"][t] = right_arm_side_left_torso <= left_torso_tol
+
+        torso_center_x = float(np.mean([left_shoulder[0], right_shoulder[0], left_hip[0], right_hip[0]]))
+        left_arm_mid_x = float(((left_shoulder + left_wrist) / 2.0)[0])
+        right_arm_mid_x = float(((right_shoulder + right_wrist) / 2.0)[0])
+        arms_mid_x = (left_arm_mid_x + right_arm_mid_x) / 2.0
+        out["arms_on_body_left"][t] = arms_mid_x < torso_center_x
+        out["arms_on_body_right"][t] = arms_mid_x > torso_center_x
+        out["valid"][t] = True
+
+    return out
+
+
+def _angle_at(p1: np.ndarray, vertex: np.ndarray, p2: np.ndarray) -> float:
+    return _angle_between(p1 - vertex, p2 - vertex)
+
+
+def _angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
+    denom = float(np.linalg.norm(v1) * np.linalg.norm(v2))
+    if denom < 1e-9:
+        return np.nan
+    cosang = float(np.dot(v1, v2) / denom)
+    return float(np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0))))
+
+
+def _signed_angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
+    if np.linalg.norm(v1) < 1e-9 or np.linalg.norm(v2) < 1e-9:
+        return np.nan
+    cross = float(v1[0] * v2[1] - v1[1] * v2[0])
+    dot = float(np.dot(v1, v2))
+    return float(np.degrees(np.arctan2(cross, dot)))
+
+
+def _straightness_angle(p1: np.ndarray, vertex: np.ndarray, p2: np.ndarray) -> float:
+    angle = _angle_at(p1, vertex, p2)
+    return min(angle, 180.0 - angle)
+
+
+def _segment_side_of_line(
+    seg_start: np.ndarray,
+    seg_end: np.ndarray,
+    line_start: np.ndarray,
+    line_end: np.ndarray,
+) -> float:
+    segment_mid = (seg_start + seg_end) / 2.0
+    line_vec = line_end - line_start
+    point_vec = segment_mid - line_start
+    return float(line_vec[0] * point_vec[1] - line_vec[1] * point_vec[0])
+
+
+def _in_range(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    return (values >= lo) & (values <= hi)
+
+
+def _range_score(values: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    center = (lo + hi) / 2.0
+    half_width = max((hi - lo) / 2.0, 1e-6)
+    return np.clip(1.0 - np.abs(values - center) / half_width, 0.0, 1.0)
+
+
+def _k_score(
+    arm_angle: np.ndarray,
+    left_straightness: np.ndarray,
+    right_straightness: np.ndarray,
+) -> np.ndarray:
+    score_1 = np.clip(1.0 - np.abs(arm_angle - 90.0) / 25.0, 0.0, 1.0)
+    left_score = np.clip(1.0 - left_straightness / 35.0, 0.0, 1.0)
+    right_score = np.clip(1.0 - right_straightness / 35.0, 0.0, 1.0)
+    score_2 = (left_score + right_score) / 2.0
+    return score_1 * 0.6 + score_2 * 0.4
+
+
+def _symmetric_angle_score(
+    left: np.ndarray,
+    right: np.ndarray,
+    lo: float,
+    hi: float,
+) -> np.ndarray:
+    angle_score = (_range_score(left, lo, hi) + _range_score(right, lo, hi)) / 2.0
+    symmetry_score = np.clip(1.0 - np.abs(left - right) / 30.0, 0.0, 1.0)
+    return angle_score * 0.8 + symmetry_score * 0.2
+
+
+def _contiguous_true_segments(mask: np.ndarray, min_frames: int) -> List[Tuple[int, int]]:
+    segments: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for i, ok in enumerate(mask):
+        if ok and start is None:
+            start = i
+        elif not ok and start is not None:
+            if i - start >= min_frames:
+                segments.append((start, i))
+            start = None
+    if start is not None and len(mask) - start >= min_frames:
+        segments.append((start, len(mask)))
+    return segments
 
 def _fill_nans(arr: np.ndarray) -> np.ndarray:
     """Fill NaN values per column via linear interpolation."""

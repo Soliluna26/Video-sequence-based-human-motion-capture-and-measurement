@@ -17,12 +17,50 @@ from src.action_recognizer import (
     TemplateStore,
     dtw_distance,
     extract_angle_features,
+    recognize_rule_based_actions,
     _normalize_angles,
     _resample_sequence,
     _fill_nans,
     _non_max_suppression,
     ANGLE_KEYS,
 )
+
+
+def _symmetric_pose(angle_deg: float, frames: int = 12) -> np.ndarray:
+    """Build a synthetic pose with equal left/right shoulder angles."""
+    pose = np.zeros((frames, 33, 2), dtype=np.float64)
+    pose[:, 11] = [0.0, 0.0]
+    pose[:, 12] = [2.0, 0.0]
+    pose[:, 23] = [0.0, 1.0]
+    pose[:, 24] = [2.0, 1.0]
+
+    theta = np.deg2rad(angle_deg)
+    left_arm = np.array([-np.sin(theta), np.cos(theta)])
+    right_arm = np.array([np.sin(theta), np.cos(theta)])
+    pose[:, 13] = pose[:, 11] + left_arm
+    pose[:, 14] = pose[:, 12] + right_arm
+    return pose
+
+
+def _k_pose(side: str, frames: int = 12) -> np.ndarray:
+    """Build a synthetic K pose with both elbows on one body side."""
+    pose = np.zeros((frames, 33, 2), dtype=np.float64)
+    pose[:, 11] = [0.0, 0.0]
+    pose[:, 12] = [2.0, 0.0]
+    pose[:, 23] = [0.0, 1.0]
+    pose[:, 24] = [2.0, 1.0]
+
+    if side == "left":
+        pose[:, 13] = [0.0, -1.0]
+        pose[:, 14] = [0.8, 0.0]
+        pose[:, 15] = [0.0, -2.0]
+        pose[:, 16] = [-0.4, 0.0]
+    else:
+        pose[:, 13] = [1.2, 0.0]
+        pose[:, 14] = [2.0, -1.0]
+        pose[:, 15] = [2.4, 0.0]
+        pose[:, 16] = [2.0, -2.0]
+    return pose
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +328,47 @@ class TestActionRecognizer:
         matches = rec.recognize(angles1, fps=30.0)
         detected_names = {m.action_name for m in matches}
         assert "deep_squat" in detected_names
+
+
+# ---------------------------------------------------------------------------
+# Rule-based static pose recognition
+# ---------------------------------------------------------------------------
+class TestRuleBasedActionRecognition:
+    """Test predefined static pose rules requested by the project."""
+
+    @pytest.mark.parametrize(
+        "angle,expected",
+        [
+            (45.0, "V_bottom"),
+            (90.0, "T_big"),
+            (120.0, "V_up"),
+            (170.0, "H_up"),
+        ],
+    )
+    def test_symmetric_arm_pose_rules(self, angle, expected):
+        pose = _symmetric_pose(angle)
+        matches = recognize_rule_based_actions(pose, fps=30.0)
+        names = {m.action_name for m in matches}
+        assert expected in names
+
+    def test_right_k_rule_uses_body_left_side(self):
+        pose = _k_pose("left")
+        matches = recognize_rule_based_actions(pose, fps=30.0)
+        names = {m.action_name for m in matches}
+        assert "K_r" in names
+        assert "K_l" not in names
+
+    def test_left_k_rule_uses_body_right_side(self):
+        pose = _k_pose("right")
+        matches = recognize_rule_based_actions(pose, fps=30.0)
+        names = {m.action_name for m in matches}
+        assert "K_l" in names
+        assert "K_r" not in names
+
+    def test_no_rule_match_for_unlisted_angle(self):
+        pose = _symmetric_pose(70.0)
+        matches = recognize_rule_based_actions(pose, fps=30.0)
+        assert matches == []
 
 
 # ---------------------------------------------------------------------------

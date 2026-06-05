@@ -7,9 +7,10 @@ and trajectory visualization.
 
 import csv
 import os
+import sys
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,14 +34,56 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+if __package__ in (None, ""):
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
 from src.gui.video_worker import VideoWorker
 from src.point_manager import PointManager
-from src.pose_estimator import KEYPOINT_NAMES, PoseResult
 from src.action_recognizer import (
     ActionRecognizer,
     TemplateStore,
     extract_angle_features,
+    recognize_rule_based_actions,
 )
+
+KEYPOINT_NAMES = [
+    "nose",
+    "left_eye_inner",
+    "left_eye",
+    "left_eye_outer",
+    "right_eye_inner",
+    "right_eye",
+    "right_eye_outer",
+    "left_ear",
+    "right_ear",
+    "mouth_left",
+    "mouth_right",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_pinky",
+    "right_pinky",
+    "left_index",
+    "right_index",
+    "left_thumb",
+    "right_thumb",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+    "left_heel",
+    "right_heel",
+    "left_foot_index",
+    "right_foot_index",
+]
+PoseResult = Any
 
 # Skeleton bone connections for drawing (MediaPipe pose connections)
 BONE_CONNECTIONS = [
@@ -404,13 +447,13 @@ class MainWindow(QMainWindow):
             self._load_angle_defs()
 
         store = self._ensure_action_store()
-        if len(store) == 0:
-            QMessageBox.information(self, "Recognize", "No templates loaded. Register an action first.")
-            return
+        self._action_matches = recognize_rule_based_actions(self._positions_smooth, self.fps)
 
-        feats = extract_angle_features(self._positions_smooth, self._angle_defs, window=5)
-        rec = ActionRecognizer(store, sensitivity=2.0)
-        self._action_matches = rec.recognize(feats, self.fps)
+        if len(store) > 0:
+            feats = extract_angle_features(self._positions_smooth, self._angle_defs, window=5)
+            rec = ActionRecognizer(store, sensitivity=2.0)
+            self._action_matches.extend(rec.recognize(feats, self.fps))
+            self._action_matches.sort(key=lambda m: (m.start_frame, m.action_name))
 
         if self._action_matches:
             msg = f"Detected {len(self._action_matches)} action(s):\n"
@@ -566,6 +609,16 @@ class MainWindow(QMainWindow):
 
     def _on_start(self):
         if not self.video_path:
+            return
+        if sys.version_info >= (3, 14):
+            QMessageBox.critical(
+                self,
+                "MediaPipe Environment Error",
+                "Current virtual environment uses Python "
+                f"{sys.version_info.major}.{sys.version_info.minor}. "
+                "MediaPipe Pose cannot run reliably on Python 3.14 in this project.\n\n"
+                "Please recreate .venv with Python 3.11 or 3.12 and reinstall requirements."
+            )
             return
 
         self.mode = "RECORDING"
@@ -788,10 +841,6 @@ class MainWindow(QMainWindow):
                 cx, cy = int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1))
                 cv2.circle(canvas, (cx, cy), 3, BLUE, -1)
 
-        # Draw measurement overlay
-        vel, dist, elapsed = self._calc_measurements(frame_idx)
-        canvas = self._draw_measurements(canvas, vel, dist, elapsed)
-
         # Draw action recognition labels
         if self._action_matches:
             canvas = self._draw_action_labels(canvas, frame_idx)
@@ -913,28 +962,6 @@ class MainWindow(QMainWindow):
 
         return vel_mm_s, dist_mm, elapsed
 
-    def _draw_measurements(self, canvas: np.ndarray, vel: float, dist: float, elapsed: float) -> np.ndarray:
-        """Overlay measurement text on canvas."""
-        lines = [
-            f"Velocity: {vel:.2f} mm/s",
-            f"Distance: {dist:.2f} mm",
-            f"Times: {elapsed:.2f} s",
-        ]
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.7
-        thickness = 2
-        color = WHITE
-        outline = (0, 0, 0)
-
-        y0 = 30
-        for i, text in enumerate(lines):
-            y = y0 + i * 30
-            cv2.putText(canvas, text, (12, y - 1), font, font_scale, outline, thickness + 2, cv2.LINE_AA)
-            cv2.putText(canvas, text, (12, y + 1), font, font_scale, outline, thickness + 2, cv2.LINE_AA)
-            cv2.putText(canvas, text, (10, y), font, font_scale, color, thickness, cv2.LINE_AA)
-
-        return canvas
-
     def _draw_action_labels(self, canvas: np.ndarray, frame_idx: int) -> np.ndarray:
         """Overlay action name banner on canvas when frame_idx falls within a match."""
         if not self._action_matches:
@@ -1026,9 +1053,6 @@ class MainWindow(QMainWindow):
                     cx, cy = int(np.clip(px, 0, w - 1)), int(np.clip(py, 0, h - 1))
                     cv2.circle(canvas, (cx, cy), 3, BLUE, -1)
 
-            vel, dist, elapsed = self._calc_measurements(frame_idx)
-            canvas = self._draw_measurements(canvas, vel, dist, elapsed)
-
             # Draw action labels in saved video
             if self._action_matches:
                 canvas = self._draw_action_labels(canvas, frame_idx)
@@ -1068,3 +1092,11 @@ class MainWindow(QMainWindow):
                     writer.writerow([frame_idx, f"{time_sec:.4f}", "manual", pid, f"manual_{pid}", f"{pos[0]:.2f}", f"{pos[1]:.2f}"])
 
         QMessageBox.information(self, "Exported", f"Tracking data saved to:\n{output_path}")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())

@@ -220,6 +220,7 @@ def run_cli():
             ActionRecognizer,
             TemplateStore,
             extract_angle_features,
+            recognize_rule_based_actions,
             ANGLE_KEYS,
         )
 
@@ -241,21 +242,24 @@ def run_cli():
                   f"({len(store)} total). Saved to {templates_path}")
 
         if args.recognize:
-            if len(store) == 0:
-                print("[Action] No templates loaded. Register one first with --register --action_name <name>")
-            else:
+            matches = recognize_rule_based_actions(positions_smooth, fps)
+            if len(store) > 0:
                 feat = extract_angle_features(positions_smooth, angle_defs, window=5)
                 recognizer = ActionRecognizer(store, sensitivity=args.sensitivity)
-                matches = recognizer.recognize(feat, fps)
-                if matches:
-                    print(f"\n[Action] Detected {len(matches)} action(s):")
-                    for m in matches:
-                        print(f"  * {m.action_name:12s} | "
-                              f"frame {m.start_frame:4d}-{m.end_frame:4d} | "
-                              f"time {m.start_sec:.1f}s-{m.end_sec:.1f}s | "
-                              f"confidence {m.confidence:.2%}")
-                else:
-                    print("[Action] No actions detected.")
+                matches.extend(recognizer.recognize(feat, fps))
+                matches.sort(key=lambda m: (m.start_frame, m.action_name))
+            else:
+                print("[Action] No DTW templates loaded; running built-in rule-based pose recognition.")
+
+            if matches:
+                print(f"\n[Action] Detected {len(matches)} action(s):")
+                for m in matches:
+                    print(f"  * {m.action_name:12s} | "
+                          f"frame {m.start_frame:4d}-{m.end_frame:4d} | "
+                          f"time {m.start_sec:.1f}s-{m.end_sec:.1f}s | "
+                          f"confidence {m.confidence:.2%}")
+            else:
+                print("[Action] No actions detected.")
 
     print(f"\nDone! Results saved to: {output_dir.resolve()}")
     return 0
